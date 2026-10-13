@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<title>Strategy Note - MFQ Test Plan for the E-Commerce System</title>
+<style>
+@page { size: A4; margin: 14mm 13mm 14mm 13mm; }
+html { font-size: 10pt; }
+body { font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+       color: #1b1b1b; line-height: 1.42; }
+h1 { font-size: 17pt; margin: 0 0 4pt; color: #14243a; }
+h2 { font-size: 12.5pt; margin: 12pt 0 4pt; color: #14243a; border-bottom: 1px solid #d4dae2; padding-bottom: 2pt; }
+h3 { font-size: 11pt; margin: 10pt 0 3pt; color: #24405f; }
+h4 { font-size: 10pt; margin: 8pt 0 2pt; color: #2f4a68; }
+p, li { margin: 2pt 0; }
+ul, ol { margin: 2pt 0 4pt 14pt; padding: 0; }
+code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 8.5pt;
+       background: #f1f3f6; padding: 0 2pt; border-radius: 2pt; }
+pre { background: #f6f7f9; border: 1px solid #e0e4ea; padding: 5pt; font-size: 8pt;
+      font-family: "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap; }
+table { border-collapse: collapse; width: 100%; margin: 4pt 0 8pt; font-size: 8.2pt; }
+th { background: #eef1f5; text-align: left; }
+th, td { border: 1px solid #cfd6df; padding: 2.5pt 4pt; vertical-align: top; }
+hr { border: none; border-top: 1px solid #cfd6df; margin: 8pt 0; }
+.lede { color: #4a5568; font-style: italic; margin-bottom: 8pt; }
+body.strategy { font-size: 8.6pt; line-height: 1.26; }
+body.strategy h1 { font-size: 13.5pt; margin-bottom: 2pt; }
+body.strategy h2 { font-size: 10pt; margin: 6pt 0 2pt; border-bottom: 1px solid #dfe4ea; padding-bottom: 1pt; }
+body.strategy p { margin: 1.5pt 0; }
+body.strategy ul { margin: 1pt 0 3pt 12pt; }
+body.strategy li { margin: 0.5pt 0; }
+body.strategy table { font-size: 7pt; margin: 2pt 0 4pt; }
+body.strategy th, body.strategy td { padding: 1.6pt 3pt; }
+body.strategy code { font-size: 7.4pt; }
+.doc { page-break-before: always; }
+</style></head>
+<body class="strategy">
+<h1>Strategy Note: MFQ Test Plan - E-Commerce System</h1>
+<h2>How priority was assigned</h2>
+<p>Priorities are assigned by a fixed rule. Two questions make a case P0: <strong>could a customer notice the defect before we do</strong>, and <strong>can we undo it</strong>. Inventory deduct, refund and reservation release fail both, which is why they hold the highest density of P0 across the 81 cases (47 P0 / 31 P1 / 3 P2).</p>
+<ul><li><strong>P0 - 47 cases:</strong> money, inventory truth, or a one-way door. Run every build and every candidate.</li><li><strong>P1 - 31 cases:</strong> the normal customer journey and its contract regressions. Run every test round.</li><li><strong>P2 - 3 cases:</strong> robustness and hygiene. Triage at milestones.</li></ul>
+<h2>Models are used as test oracles, not as documentation</h2>
+<p>Each M layer model hands the suite something falsifiable. The <strong>state machine</strong> hands us guards, which become "the illegal transition must be refused" (F3-16, F4-11) - the check that stops a refund being issued against an already-shipped order. The <strong>inventory invariant</strong> <code>available + reserved + frozen = on_hand - safety_stock</code> is asserted before and after every inventory case and sampled continuously under load. The <strong>consistency table</strong> turns an unverifiable phrase into a testable one: every eventual boundary has a named reconciliation point with a numeric tolerance, and a boundary without one is treated as an untested bug. That is why the M layer carries five models and the dedicated sections carry three specifications: the 81 executable cases live in F and Q, and not one of them checks "the order list renders" - each asserts something a model declares.</p>
+<h2>Trade-offs made on purpose</h2>
+<table><thead><tr><th>Decision</th><th>Cost</th><th>Why it is still right</th></tr></thead><tbody><tr><td>Depth on inventory sync, breadth on payments</td><td>Only the primary channel gets a full matrix</td><td>Channel two shares the callback contract covered by F4-07; its own matrix is deferred with a named approver</td></tr><tr><td>A mock WMS with fault injection, not the real WMS</td><td>The mock can drift from the real contract</td><td>Seven fault classes become deterministic on demand; a real WMS cannot be made to lose an ACK. Contract tests gate every mock change</td></tr><tr><td>API-first, one UI smoke journey</td><td>Checkout UI regression is not covered</td><td>Inventory and money change at the API; the gap is a named residual risk, not an oversight</td></tr><tr><td>8-hour soak instead of 72 hours</td><td>Very slow leaks could survive</td><td>8h at 1.2x peak plus hourly reconciliation exposes drift growth; the extra 64 hours buy little for a release slot</td></tr><tr><td>No "exactly once" assertions</td><td>No exactly-once claim</td><td>The design assumes at-least-once everywhere; testing a property we refuse to rely on validates the wrong thing</td></tr><tr><td>Observability cases at P0/P1 weight</td><td>Execution time up front</td><td>An alert that is never verified is an outage with extra latency</td></tr></tbody></table>
+<h2>Not tested, and recorded as residual risk</h2>
+<p>Payment-gateway internals, carrier routing, coupon rules, full UI regression and WMS internal logic</p>
+<ul><li>each is a third party or a lower-value surface this iteration, and each carries a named approver.</li></ul>
+<h2>If the time box changes</h2>
+<ul><li><strong>Half the time:</strong> keep every P0, drop the P2 set, run the F2 fault matrix once instead of twenty times. Never drop the invariant assertions - cheapest coverage per second in the plan.</li><li><strong>Double the time:</strong> add the second payment channel, a multi-region failover drill, and 72h of message-layer fuzzing with automatic drift detection.</li></ul>
+<h2>The numbers that gate the release</h2>
+<p>No oversell. Zero negative inventory buckets. Inventory diff ratio under 0.05% per warehouse after 24 hours of continuous reconciliation. Zero unexplained differences. Every seeded drift repaired within SLA by a named compensation job. These five checks, rather than a pass-rate percentage, decide the release.</p>
+</body></html>

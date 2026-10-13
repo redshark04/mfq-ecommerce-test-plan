@@ -1,0 +1,156 @@
+# MFQ Test Plan - E-Commerce System
+
+- M M: Models
+  - M1 End-to-End Business Flow Model
+    - [table] E2E stages: actor, system action, inventory effect, consistency contract
+    - M1.1 Stage-level failure modes (must be covered by F cases)
+      - Stage 3 fails: reserve times out or WMS says insufficient -> order must be REJECTED, no ledger entry left behind.
+      - Stage 4 fails after money moved: payment callback lost or gateway error -> order must not stay PENDING_PAYMENT silently; reconciliation job must find and repair it.
+      - Stage 5 fails: SO push rejected or ACK lost -> order must not be double-pushed; retry must be idempotent by SO id.
+      - Stage 6 out-of-order: ship notice arriving before allocation ACK must not corrupt state.
+      - Stage 8 partial: only the returned quantity may be restored; the rest stays sold.
+      - Stage 10 abnormal close: any non-terminal order closed by a job must release its reservation first.
+  - M2 Order State Machine
+    - [table] States
+    - [table] Transitions: event, guard, side effect
+    - [table] Illegal transitions that MUST be rejected (negative oracles)
+  - M3 Inventory State Model
+    - [table] Quantity model (granularity: sku_id x warehouse_code)
+    - [table] Core invariant (asserted by every inventory test case and by the reconciliation job)
+    - [table] Ledger entry types and their transition
+    - [table] Cross-channel and multi-warehouse rules
+  - M4 External Interaction Model (Storefront <-> WMS/SC2P)
+    - [table] Message catalog
+    - M4.1 Interface contracts that must be frozen before test execution
+      - Signed OpenAPI/JSON-Schema for E1, E8 and E9, published to the test team and validated by contract tests.
+      - Message schema version field on every MQ message, with a documented compatibility rule (additive only within a major version).
+      - Published error-code dictionary shared by platform, WMS and gateway, including retryable vs non-retryable classification.
+      - Clock-skew tolerance declared (+/-5min) and enforced identically on both sides.
+      - A mock WMS/SC2P with a fault-injection switch per message type, so every E-case can be driven deterministically.
+  - M5 Consistency Boundaries and Reconciliation Points
+    - [table] Consistency boundaries
+    - [table] Reconciliation points and cadence
+    - M5.1 Why these modes (design rationale to defend in review)
+      - C1 is strong because an oversell is unrecoverable: you cannot un-sell 200 units of a 100-unit SKU.
+      - C4 is eventual and must tolerate the lost-ACK case, because the physical shipment already happened; refusing the ship notice corrupts customer-visible reality.
+      - C5 lets WMS win on on_hand but never lets a snapshot silently delete a live reservation, otherwise a bulk sync becomes an oversell machine.
+      - C2 and C7 are strong because a duplicated payment effect moves real money and shows up as a chargeback.
+      - Every eventual boundary carries a named reconciliation point and a numeric tolerance; a boundary without one is treated as an untested defect.
+- F F: Functional
+  - F1 Core Happy Path and Order Acceptance
+    - F1-01 Create order: single SKU, sufficient stock in one warehouse [P0]
+    - F1-02 Create order: multiple SKUs, one warehouse, all in stock [P0]
+    - F1-03 Create order spanning two warehouses: allocation splits the lines [P1]
+    - F1-04 Cart validation: SKU taken off shelf between add-to-cart and submit [P1]
+    - F1-05 Price changed between add-to-cart and submit [P1]
+    - F1-06 Payment success on the primary channel produces PAID plus DEDUCT [P0]
+    - F1-07 Full shipment in a single package moves the order to SHIPPED [P0]
+    - F1-08 Partial shipment then the remaining lines completes the order [P1]
+    - F1-09 Shopper confirms receipt: SHIPPED -> SIGNED and the return window opens [P0]
+    - F1-10 Auto-sign after the logistics SLA with no shopper action [P1]
+    - F1-11 Order auto-completes when the return window expires with no RMA [P2]
+    - F1-12 Return journey: RMA, receipt, QC pass, refund, stock restored [P0]
+  - F2 Inventory Synchronization Scenarios
+    - [table] Fault-injection matrix used by the F2 cases (mock WMS/SC2P switch)
+    - F2-01 Reserve success moves available to reserved exactly once [P0]
+    - F2-02 Reserve failure on insufficient available stock [P0]
+    - F2-03 Reserve failure when WMS pre-check times out (fail fast, no partial hold) [P0]
+    - F2-04 Deduct success after payment moves reserved to sold and reduces on_hand [P0]
+    - F2-05 Deduct failure after money moved must be compensated, never lost [P0]
+    - F2-06 Cancel an unpaid order releases the reservation exactly once [P0]
+    - F2-07 Cancel/refund a paid order before shipment applies the compensating ledger [P1]
+    - F2-08 Idempotency: duplicate RESERVE for the same order creates one hold [P0]
+    - F2-09 Idempotency: duplicate DEDUCT for the same pay_no creates one deduct [P0]
+    - F2-10 Idempotency: duplicate payment callback at the public endpoint [P0]
+    - F2-11 Out-of-order: E3 ShipNotice arrives before E2 AllocationAck [P0]
+    - F2-12 Out-of-order: a StockChangeEvent older than the last applied event_ts is ignored [P0]
+    - F2-13 Message delayed beyond TTL is rejected and logged, not applied [P1]
+    - F2-14 Stale bulk snapshot version must not overwrite newer in-flight state [P0]
+    - F2-15 Snapshot whose on_hand is lower than reserved must not silently delete a reservation [P0]
+    - F2-16 Unknown or malformed message never mutates state [P1]
+    - F2-17 Return receipt restores only the received quantity; duplicates are no-ops [P1]
+    - F2-18 Reconciliation detects a seeded drift and repairs it with an audited ADJUST [P0]
+    - F2-19 Reservation TTL guard releases expired reservations [P1]
+    - F2-20 An unbalanced SKU is frozen from sale and paged, not silently traded [P1]
+  - F3 Boundary, Race and Volume Scenarios
+    - F3-01 Zero stock: available = 0 rejects the order without creating a negative bucket [P0]
+    - F3-02 Two concurrent submissions contend for the last unit: exactly one succeeds [P0]
+    - F3-03 Flash sale burst: 20k QPS for 10s against 500 units [P0]
+    - F3-04 Small-scale contention: 50 concurrent requests against 10 units [P0]
+    - F3-05 Quantity boundaries: zero, negative, fractional, over the per-order cap, and exactly equal to available [P1]
+    - F3-06 Payment callback and the timeout-close job race at the same instant [P0]
+    - F3-07 Timeout boundary precision: 29:59 stays open, 30:01 is closed [P1]
+    - F3-08 Partial shipment does not change sold quantities [P1]
+    - F3-09 Split shipment across two warehouses produces two packages under one order [P1]
+    - F3-10 Partial return restores only the returned quantity [P0]
+    - F3-11 Return that fails QC is not restored to sellable stock [P1]
+    - F3-12 Duplicate return receipt for one RMA restores stock only once [P0]
+    - F3-13 Oversized payload / very large order [P2]
+    - F3-14 Duplicate submit of the same cart (double click / retry) yields one order [P0]
+    - F3-15 Post-flash-sale conservation: nothing created, nothing lost [P0]
+    - F3-16 Cancel or refund a SHIPPED order is refused by the state guard [P1]
+  - F4 Critical API and Contract Validation
+    - F4-01 createOrder request-field validation [P0]
+    - F4-02 createOrder idempotency key is required and honoured [P0]
+    - F4-03 Authentication and replay protection on write APIs [P0]
+    - F4-04 Authorization isolation between tenants/users [P1]
+    - F4-05 Error-code contract: business errors are 4xx with documented codes [P0]
+    - F4-06 Client-supplied price or quantity is never trusted [P0]
+    - F4-07 Payment callback write-back contract [P0]
+    - F4-08 WMS ship-notice write-back contract [P1]
+    - F4-09 Stock synchronization message schema and version guard [P1]
+    - F4-10 Query API limits and encoding [P2]
+    - F4-11 Cancel/refund API validation and guards [P1]
+    - F4-12 Sensitive-data masking in responses, logs and messages [P0]
+    - F4-13 No internal-field leakage from storefront responses [P1]
+- Q Q: Quality
+  - Q1 Performance
+    - [table] Performance targets (must be met at 1.5x the projected peak)
+    - [table] Load model and pass conditions
+    - Q1-01 Flash-sale burst causes zero oversell and zero invariant violation [P0]
+    - Q1-02 Sustained peak does not degrade into a queue collapse [P0]
+    - Q1-03 Eight-hour soak shows no leak and no slow drift [P1]
+    - Q1-04 Breakpoint behavior fails closed, never corrupts [P1]
+  - Q2 Reliability
+    - [table] Reliability mechanisms and parameters
+    - [table] Chaos and recovery drills (run in TEST/STAGE before release)
+    - Q2-01 Seeded drift classes are all detected and compensated within SLA [P0]
+    - Q2-02 Circuit breaker and fail-fast under a WMS outage [P0]
+    - Q2-03 Timeout and retry produce no duplicate effect [P0]
+    - Q2-04 Message-order guarantees hold under a reordering storm [P1]
+  - Q3 Observability
+    - [table] Required metrics
+    - [table] Alerts, severity and required action
+    - [table] Logging, tracing and audit requirements
+    - Q3-01 Every alert in the catalog fires on a synthetically injected condition [P0]
+    - Q3-02 Inventory diff ratio reflects a real divergence within one cycle [P0]
+    - Q3-03 Trace continuity across the storefront-WMS boundary [P1]
+    - Q3-04 Stuck-order detection covers every non-terminal stage [P1]
+  - Q4 Security
+    - [table] Security requirements and verification
+    - Q4-01 Callback authenticity cannot be bypassed [P0]
+    - Q4-02 Privileged inventory adjustment requires authorization and leaves an audit trail [P0]
+    - Q4-03 No PII in logs, metrics or outbound messages [P0]
+    - Q4-04 Release gate: dependency and image scan [P1]
+  - Q5 Recoverability
+    - [table] Failure drills and targets
+    - [table] Data-repair process (one procedure, three classes)
+    - Q5-01 Database failover loses no order and no ledger entry [P0]
+    - Q5-02 Point-in-time restore reproduces known totals [P1]
+    - Q5-03 Stock recalibration from the WMS source of truth is safe and audited [P1]
+    - Q5-04 Rollback of a release is verified, not assumed [P1]
+- S Dedicated Sections (mandatory)
+  - S4 Dedicated: Inventory Synchronization Consistency
+    - [table] S4.1 The guarantee, stated as falsifiable claims
+    - [table] S4.2 Defect classes this section must prevent (and the case that catches each)
+    - [table] S4.3 Conflict resolution rules (who wins, and why)
+    - [table] S4.4 Test approach and exit thresholds for consistency
+  - S5 Dedicated: Exception Handling and Compensation Strategy
+    - [table] S5.1 Exception taxonomy and handling policy
+    - [table] S5.2 Compensation job catalog (each drift class has exactly one owner)
+    - [table] S5.3 Pattern selection per boundary
+    - [table] S5.4 Manual intervention playbook (what the runbook must contain)
+  - S6 Dedicated: Release Entry and Exit Criteria
+    - [table] S6.1 Entry criteria (all must hold before the test round starts)
+    - [table] S6.2 Exit criteria (all must hold before the release is approved)
+    - [table] S6.3 Residual-risk acceptance (what is knowingly deferred)

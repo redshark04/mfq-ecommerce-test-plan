@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<title>MFQ Test Plan and Test Case Design</title>
+<style>
+@page { size: A4; margin: 14mm 13mm 14mm 13mm; }
+html { font-size: 10pt; }
+body { font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+       color: #1b1b1b; line-height: 1.42; }
+h1 { font-size: 17pt; margin: 0 0 4pt; color: #14243a; }
+h2 { font-size: 12.5pt; margin: 12pt 0 4pt; color: #14243a; border-bottom: 1px solid #d4dae2; padding-bottom: 2pt; }
+h3 { font-size: 11pt; margin: 10pt 0 3pt; color: #24405f; }
+h4 { font-size: 10pt; margin: 8pt 0 2pt; color: #2f4a68; }
+p, li { margin: 2pt 0; }
+ul, ol { margin: 2pt 0 4pt 14pt; padding: 0; }
+code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 8.5pt;
+       background: #f1f3f6; padding: 0 2pt; border-radius: 2pt; }
+pre { background: #f6f7f9; border: 1px solid #e0e4ea; padding: 5pt; font-size: 8pt;
+      font-family: "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap; }
+table { border-collapse: collapse; width: 100%; margin: 4pt 0 8pt; font-size: 8.2pt; }
+th { background: #eef1f5; text-align: left; }
+th, td { border: 1px solid #cfd6df; padding: 2.5pt 4pt; vertical-align: top; }
+hr { border: none; border-top: 1px solid #cfd6df; margin: 8pt 0; }
+.lede { color: #4a5568; font-style: italic; margin-bottom: 8pt; }
+body.strategy { font-size: 8.6pt; line-height: 1.26; }
+body.strategy h1 { font-size: 13.5pt; margin-bottom: 2pt; }
+body.strategy h2 { font-size: 10pt; margin: 6pt 0 2pt; border-bottom: 1px solid #dfe4ea; padding-bottom: 1pt; }
+body.strategy p { margin: 1.5pt 0; }
+body.strategy ul { margin: 1pt 0 3pt 12pt; }
+body.strategy li { margin: 0.5pt 0; }
+body.strategy table { font-size: 7pt; margin: 2pt 0 4pt; }
+body.strategy th, body.strategy td { padding: 1.6pt 3pt; }
+body.strategy code { font-size: 7.4pt; }
+.doc { page-break-before: always; }
+</style></head>
+<body>
+<h1>MFQ Test Plan and Test Case Design</h1>
+<h2>E-Commerce System (Product / Inventory / Cart / Order / WMS-SC2P Sync)</h2>
+<table><thead><tr><th>Attribute</th><th>Value</th></tr></thead><tbody><tr><td>Document</td><td>MFQ-ECOM-001</td></tr><tr><td>Framework</td><td>MFQ - Models / Functional / Quality</td></tr><tr><td>Version / date</td><td>1.0 / 2026-10-13</td></tr><tr><td>Case count</td><td>81 executable cases across 9 modules (F1-F4 and Q1-Q5). The M layer and the dedicated sections contribute models and specifications; the traceability matrix maps each of them to the cases that carry the assertion</td></tr><tr><td>Reading order</td><td>M -&gt; F -&gt; Q -&gt; dedicated sections -&gt; traceability matrix. The dedicated sections are cross-layer summaries; read them after F.</td></tr></tbody></table>
+<h2>0. Objective</h2>
+<p>Design a <strong>risk-based test plan</strong> for an e-commerce system using the <strong>MFQ (Models - Functional - Quality)</strong> framework. The plan must show three things a reviewer can grade independently:</p>
+<ol><li><strong>M - Models.</strong> Do we understand the system before testing it? Business flow, order state machine, inventory state model, external interaction model, and the <em>consistency boundaries</em> between them.</li><li><strong>F - Functional.</strong> Does the functional coverage actually exercise those models: happy path, the inventory-synchronization contract, boundary/race conditions, and the API contract itself?</li><li><strong>Q - Quality.</strong> Are the non-functional risks (performance, reliability, observability, security, recoverability) controlled by measurable targets, not adjectives?</li></ol>
+<p>The single most expensive defect class in this system is <strong>inventory truth</strong>: an oversell, a double deduct, a lost deduct or a leaked reservation is either direct money loss or an incorrect promise shown to the customer. Every layer below is therefore anchored to inventory consistency as the primary risk.</p>
+<h3>0.1 Scope in</h3>
+<ul><li>Product/SPU-SKU listing, price and sellable-quantity exposure to the storefront</li><li>Cart validation and order submission (single-SKU, multi-SKU, multi-warehouse)</li><li>Order lifecycle: place -&gt; pay -&gt; allocate -&gt; ship (partial/split) -&gt; sign -&gt; return -&gt; refund -&gt; close</li><li>Inventory states: available, reserved, deducted (sold), restored, frozen</li><li>Bidirectional sync with WMS/SC2P: order push, allocation, ship notice, stock snapshot/stream, inbound receipt, QC result, return receipt</li><li>Payment gateway callback handling and refund write-back</li><li>Customer/admin APIs that mutate order or inventory state, plus their validation contracts</li></ul>
+<h3>0.2 Scope out</h3>
+<ul><li>Third-party WMS/SC2P internal logic (covered only through its external interface and fault-injection behavior)</li><li>Payment gateway internals (simulated via sandbox plus callback replay)</li><li>Logistics carrier routing and last-mile optimization</li><li>Marketing/coupon engine business rules (touched only for price-tamper and concurrency checks)</li><li>Native mobile client UI rendering beyond the API contract (only API-level plus one smoke journey)</li></ul>
+<h3>0.3 Assumptions the plan depends on</h3>
+<ol><li>WMS/SC2P is the <strong>authoritative source of physical stock</strong>; the platform owns the sellable (available) view and the reservation ledger.</li><li>All external messages are <strong>at-least-once</strong>; correctness must come from idempotency, not from exactly-once delivery.</li><li>Inventory is tracked per <strong>(sku_id, warehouse_code)</strong>; a SKU may be sellable from several warehouses and an order may be split across them.</li><li>Callback and message processing is <strong>asynchronous</strong>; the storefront may observe states out of order and must never display a state that contradicts the ledger.</li><li>Peak traffic is flash-sale shaped: a ~10-second burst of 20k+ QPS against a SKU with a few hundred units, i.e. a contention-heavy, low-inventory profile.</li><li>Environment split: DEV (functional), TEST/STAGE (integration + fault injection + full MFQ run), PERF (isolated data set, production-like topology).</li></ol>
+<h3>0.4 Risk register</h3>
+<p><strong>Top product risks driving this plan (and the layer that controls each)</strong></p>
+<table><thead><tr><th>#</th><th>Risk</th><th>Impact</th><th>Controlled by</th><th>Blast radius</th></tr></thead><tbody><tr><td>R1</td><td>Oversell under flash-sale concurrency (available goes negative)</td><td>Direct money loss, legal, brand</td><td>F2 / F3 / Q1 / S4</td><td>Whole SKU, all channels</td></tr><tr><td>R2</td><td>Lost or duplicated deduct between order and WMS</td><td>Silent inventory drift, later oversell</td><td>F2 / Q2 / S5</td><td>Grows over days</td></tr><tr><td>R3</td><td>Order stuck in a non-terminal state (paid but never shipped)</td><td>Refund cost, CS load, SLA breach</td><td>F1 / F2 / Q2 / Q3</td><td>Per order</td></tr><tr><td>R4</td><td>Duplicate or reordered callback double-applies a state change</td><td>Double refund / double deduct</td><td>F2 / F4</td><td>Per order</td></tr><tr><td>R5</td><td>Stale WMS snapshot overwrites in-flight reservations</td><td>Phantom stock or lost stock</td><td>F2 / S4</td><td>Whole warehouse</td></tr><tr><td>R6</td><td>Data drift with no repair path</td><td>Manual firefighting, audit failure</td><td>Q5 / S5</td><td>System-wide</td></tr><tr><td>R7</td><td>PII leak via logs, callbacks or admin API</td><td>Compliance and trust</td><td>Q4</td><td>Customer base</td></tr><tr><td>R8</td><td>Peak overload collapses order creation (cascading failure)</td><td>Revenue stop during peak</td><td>Q1 / Q2</td><td>Site-wide</td></tr></tbody></table>
+<h3>0.5 MFQ structure at a glance</h3>
+<ul><li><strong>M: Models</strong> - Five models, each with the invariant or guard that makes it testable.</li><li><strong>F: Functional</strong> - Functional coverage expressed as a case tree: every case carries an id, a priority, preconditions, steps and an expected result traceable to a model.</li><li><strong>Q: Quality</strong> - Non-functional risk control: measurable targets, parameterised mechanisms, and drills with explicit targets.</li><li><strong>Dedicated Sections (mandatory)</strong> - The three sections the brief marks as mandatory, viewed across layers: inventory synchronization consistency, exception handling and compensation, and release entry/exit criteria.</li></ul>
+<h2>1. M: Models</h2>
+<p>Five models, each with the invariant or guard that makes it testable.</p>
+<h3>M1 End-to-End Business Flow Model</h3>
+<p>The flow crosses three ownership boundaries: <strong>storefront</strong> (order intent and payment), <strong>platform inventory</strong> (reservations and the sellable view) and <strong>WMS/SC2P</strong> (physical stock and outbound execution). Every stage is listed with the inventory effect it must produce, so each stage becomes a directly testable assertion rather than a narrative.</p>
+<p><strong>E2E stages: actor, system action, inventory effect, consistency contract</strong></p>
+<table><thead><tr><th>#</th><th>Stage</th><th>Trigger / actor</th><th>System actions</th><th>Inventory effect</th><th>Consistency contract</th></tr></thead><tbody><tr><td>1</td><td>Browse / quote</td><td>Shopper reads SKU</td><td>Read SPU-SKU, price, sellable qty</td><td>none</td><td>Read-your-writes on available qty</td></tr><tr><td>2</td><td>Add to cart</td><td>Shopper</td><td>Validate on-shelf status, re-price</td><td>none</td><td>Price and qty revalidated again at submit</td></tr><tr><td>3</td><td>Submit order</td><td>Shopper</td><td>Create order, freeze price, reserve stock, create payment intent</td><td>available -1, reserved +1 per SKU</td><td>STRONG: no oversell, no negative available</td></tr><tr><td>4</td><td>Pay</td><td>Shopper + payment gateway</td><td>Create pay record, receive async callback, mark paid</td><td>reserved -1, sold +1, on_hand -1</td><td>STRONG + idempotent on pay_no</td></tr><tr><td>5</td><td>Allocate / fulfil</td><td>Platform -&gt; WMS/SC2P</td><td>Push sales order (SO), receive allocation ACK, receive pick/pack status</td><td>none on platform; WMS reserves physically</td><td>EVENTUAL, at-least-once, idempotent by SO id</td></tr><tr><td>6</td><td>Ship</td><td>WMS/SC2P -&gt; platform</td><td>Receive ship notice (packages, tracking no, SKU split)</td><td>none (deduct already applied at pay)</td><td>EVENTUAL; must reconcile platform sold vs WMS outbound</td></tr><tr><td>7</td><td>Deliver / sign</td><td>Carrier -&gt; platform</td><td>Update logistics, confirm receipt, open return window</td><td>none</td><td>EVENTUAL</td></tr><tr><td>8</td><td>Return</td><td>Shopper + WMS</td><td>Create RMA, receive goods, QC</td><td>on QC pass: on_hand +1, available +1, sold -1</td><td>EVENTUAL + compensating</td></tr><tr><td>9</td><td>Refund</td><td>Platform -&gt; gateway</td><td>Refund request, gateway callback</td><td>none</td><td>STRONG + idempotent on refund_no</td></tr><tr><td>10</td><td>Close</td><td>Scheduler</td><td>Auto-sign (15d), auto-complete (return window), archive</td><td>release any leftover reservation on abnormal close</td><td>EVENTUAL; must never close with a live reservation</td></tr></tbody></table>
+<pre class="diagram">flowchart LR
+  A[Browse / Quote] --&gt; B[Add to Cart]
+  B --&gt; C[Submit Order]
+  C --&gt;|reserve available-&gt;reserved| D[PENDING_PAYMENT]
+  D --&gt;|pay callback| E[PAID: reserved-&gt;sold]
+  D --&gt;|30min timeout| X1[CLOSED: release]
+  D --&gt;|user cancel| X2[CANCELED: release]
+  E --&gt; F[Push SO to WMS]
+  F --&gt; G[TO_SHIP]
+  G --&gt;|partial| H[PARTIAL_SHIPPED]
+  G --&gt;|all| I[SHIPPED]
+  H --&gt; I
+  I --&gt;|user or 15d auto| J[SIGNED]
+  J --&gt;|RMA + QC pass| K[RETURNED: restore]
+  J --&gt;|window expiry| L[COMPLETED]
+  K --&gt; M[REFUNDED]</pre>
+<h4>M1.1 Stage-level failure modes (must be covered by F cases)</h4>
+<ul><li>Stage 3 fails: reserve times out or WMS says insufficient -&gt; order must be REJECTED, no ledger entry left behind.</li><li>Stage 4 fails after money moved: payment callback lost or gateway error -&gt; order must not stay PENDING_PAYMENT silently; reconciliation job must find and repair it.</li><li>Stage 5 fails: SO push rejected or ACK lost -&gt; order must not be double-pushed; retry must be idempotent by SO id.</li><li>Stage 6 out-of-order: ship notice arriving before allocation ACK must not corrupt state.</li><li>Stage 8 partial: only the returned quantity may be restored; the rest stays sold.</li><li>Stage 10 abnormal close: any non-terminal order closed by a job must release its reservation first.</li></ul>
+<h3>M2 Order State Machine</h3>
+<p>14 states, five of them terminal, and an explicit guard (or an explicit refusal) on every transition. Each transition lists a guard that is enforced before the transition runs. An omitted guard is how a refund gets issued against an already-shipped order, so the guards act as test oracles.</p>
+<p><strong>States</strong></p>
+<table><thead><tr><th>State</th><th>Meaning (observable)</th><th>Terminal</th></tr></thead><tbody><tr><td>REJECTED</td><td>Order creation attempted but inventory reservation failed</td><td>yes</td></tr><tr><td>PENDING_PAYMENT</td><td>Order exists, price frozen, stock reserved, awaiting payment</td><td>no</td></tr><tr><td>CANCELED</td><td>Shopper canceled before payment, reservation released</td><td>yes</td></tr><tr><td>CLOSED</td><td>Unpaid order auto-closed by timeout job, reservation released</td><td>yes</td></tr><tr><td>PAID</td><td>Payment callback accepted, stock deducted (reserved -&gt; sold)</td><td>no</td></tr><tr><td>TO_SHIP</td><td>Sales order acknowledged by WMS/SC2P as allocatable</td><td>no</td></tr><tr><td>PARTIAL_SHIPPED</td><td>Some SKUs or packages of the order shipped</td><td>no</td></tr><tr><td>SHIPPED</td><td>All order lines shipped</td><td>no</td></tr><tr><td>SIGNED</td><td>All packages signed for, return window opened</td><td>no</td></tr><tr><td>RETURNING</td><td>RMA created, goods in transit back to warehouse</td><td>no</td></tr><tr><td>RETURNED</td><td>Goods received and QC passed, stock restored</td><td>no</td></tr><tr><td>REFUNDING</td><td>Refund in flight to the payment channel</td><td>no</td></tr><tr><td>REFUNDED</td><td>Refund confirmed by gateway callback</td><td>yes</td></tr><tr><td>COMPLETED</td><td>Return window expired with no RMA</td><td>yes</td></tr></tbody></table>
+<p><strong>Transitions: event, guard, side effect</strong></p>
+<table><thead><tr><th>From</th><th>Event</th><th>Guard / transition condition</th><th>To</th><th>Side effects (inventory, external)</th></tr></thead><tbody><tr><td>(new)</td><td>createOrder</td><td>Cart valid AND reserve(available&gt;=qty) succeeds for all lines</td><td>PENDING_PAYMENT</td><td>ledger RESERVE per SKU; create payment intent</td></tr><tr><td>(new)</td><td>createOrder</td><td>reserve fails (insufficient / timeout)</td><td>REJECTED</td><td>no ledger entry persisted; metric reserve_fail++</td></tr><tr><td>PENDING_PAYMENT</td><td>paySuccess (gateway callback)</td><td>signature valid AND amount == order amount AND pay_no unseen</td><td>PAID</td><td>ledger DEDUCT per SKU (reserved-&gt;sold, on_hand-1); emit OrderPaid</td></tr><tr><td>PENDING_PAYMENT</td><td>paySuccess (duplicate callback)</td><td>same pay_no already applied</td><td>PENDING_PAYMENT unchanged</td><td>no-op, return success (idempotent), metric duplicate_callback++</td></tr><tr><td>PENDING_PAYMENT</td><td>payFailed</td><td>gateway returns failure</td><td>PENDING_PAYMENT unchanged</td><td>no ledger change; allow retry within timeout</td></tr><tr><td>PENDING_PAYMENT</td><td>paymentTimeoutJob</td><td>now - created_at &gt;= 30min AND not paid</td><td>CLOSED</td><td>ledger RELEASE per SKU; close payment intent</td></tr><tr><td>PENDING_PAYMENT</td><td>userCancel</td><td>not paid</td><td>CANCELED</td><td>ledger RELEASE per SKU</td></tr><tr><td>PAID</td><td>wmsAllocationAck</td><td>SO accepted for at least one line</td><td>TO_SHIP</td><td>persist SO id, warehouse allocation</td></tr><tr><td>PAID</td><td>refundBeforeShip</td><td>not yet shipped AND rule allows</td><td>REFUNDING</td><td>compensating ledger per policy (see S5)</td></tr><tr><td>TO_SHIP</td><td>shipNotice (partial)</td><td>shipped qty &lt; ordered qty</td><td>PARTIAL_SHIPPED</td><td>record packages, tracking no; sold stays</td></tr><tr><td>TO_SHIP</td><td>shipNotice (full)</td><td>shipped qty == ordered qty</td><td>SHIPPED</td><td>record packages; trigger auto-sign timer</td></tr><tr><td>PARTIAL_SHIPPED</td><td>shipNotice (remaining)</td><td>cumulative shipped qty == ordered qty</td><td>SHIPPED</td><td>record packages; trigger auto-sign timer</td></tr><tr><td>SHIPPED</td><td>userConfirmReceipt</td><td>logistics status delivered</td><td>SIGNED</td><td>open return window (7d for restockable)</td></tr><tr><td>SHIPPED</td><td>autoSignJob</td><td>now - shipped_at &gt;= 15d AND logistics delivered</td><td>SIGNED</td><td>open return window</td></tr><tr><td>SIGNED</td><td>createRMA</td><td>within window AND SKU is returnable</td><td>RETURNING</td><td>create RMA, notify WMS</td></tr><tr><td>RETURNING</td><td>wmsReturnReceived + QCPass</td><td>qty received matches RMA</td><td>RETURNED</td><td>ledger RESTORE (on_hand+1, available+1, sold-1)</td></tr><tr><td>RETURNING</td><td>QCFail</td><td>goods not resellable</td><td>SIGNED (unchanged, RMA closed)</td><td>no RESTORE; ledger note with reason QC_FAIL</td></tr><tr><td>RETURNED</td><td>refundRequested</td><td>refund accepted by the gateway and no dispute is open</td><td>REFUNDING</td><td>create the refund record with reason RETURN_REFUND</td></tr><tr><td>RETURNED</td><td>refundSuccess</td><td>gateway confirms the refund (synchronous, or after REFUNDING)</td><td>REFUNDED</td><td>emit RefundDone; order terminal</td></tr><tr><td>SIGNED</td><td>returnWindowExpiryJob</td><td>no RMA within window</td><td>COMPLETED</td><td>none</td></tr><tr><td>CANCELED / CLOSED / REJECTED / REFUNDED / COMPLETED</td><td>any</td><td>state is terminal</td><td>unchanged</td><td>reject the event, return ORDER_STATE_ILLEGAL</td></tr></tbody></table>
+<p><strong>Illegal transitions that MUST be rejected (negative oracles)</strong></p>
+<table><thead><tr><th>Attempted transition</th><th>Expected result</th></tr></thead><tbody><tr><td>SHIPPED -&gt; paySuccess</td><td>ORDER_STATE_ILLEGAL, no ledger change</td></tr><tr><td>CLOSED -&gt; paySuccess</td><td>ORDER_STATE_ILLEGAL; payment must be routed to auto-refund instead of reviving the order</td></tr><tr><td>SIGNED -&gt; shipNotice again</td><td>idempotent no-op, no second deduct</td></tr><tr><td>RETURNED -&gt; RESTORE twice (duplicate return receipt)</td><td>second RESTORE rejected as duplicate, ledger unchanged</td></tr><tr><td>Any transition on an order whose ledger is unbalanced</td><td>blocked by invariant check; raises data-consistency alert</td></tr></tbody></table>
+<pre class="diagram">stateDiagram-v2
+  [*] --&gt; PENDING_PAYMENT: createOrder + reserve OK
+  [*] --&gt; REJECTED: reserve failed
+  PENDING_PAYMENT --&gt; PAID: paySuccess (idempotent)
+  PENDING_PAYMENT --&gt; CLOSED: 30min timeout
+  PENDING_PAYMENT --&gt; CANCELED: user cancel
+  PAID --&gt; TO_SHIP: wmsAllocationAck
+  PAID --&gt; REFUNDING: refund before ship
+  TO_SHIP --&gt; PARTIAL_SHIPPED: partial ship notice
+  TO_SHIP --&gt; SHIPPED: full ship notice
+  PARTIAL_SHIPPED --&gt; SHIPPED: remaining shipped
+  SHIPPED --&gt; SIGNED: user sign or 15d auto
+  SIGNED --&gt; RETURNING: RMA created
+  SIGNED --&gt; COMPLETED: window expiry
+  RETURNING --&gt; RETURNED: received + QC pass (restore)
+  RETURNING --&gt; SIGNED: QC fail (no restore)
+  RETURNED --&gt; REFUNDING: refund requested
+  REFUNDING --&gt; REFUNDED: gateway confirms
+  RETURNED --&gt; REFUNDED: refund confirmed synchronously
+  REFUNDED --&gt; [*]
+  COMPLETED --&gt; [*]
+  CANCELED --&gt; [*]
+  CLOSED --&gt; [*]
+  REJECTED --&gt; [*]</pre>
+<h3>M3 Inventory State Model</h3>
+<p>Four buckets (on_hand, available, reserved, frozen) plus a cumulative sold counter, six invariants and one append-only ledger. The invariants are what make inventory testable: every case asserts them <strong>before and after</strong>, and the reconciliation jobs assert them continuously.</p>
+<p><strong>Quantity model (granularity: sku_id x warehouse_code)</strong></p>
+<table><thead><tr><th>Field</th><th>Meaning</th><th>Source of truth</th><th>Changed by</th></tr></thead><tbody><tr><td>on_hand</td><td>Physically present stock</td><td>WMS/SC2P</td><td>Inbound receipt, outbound confirm, return receipt, ADJUST</td></tr><tr><td>available</td><td>Sellable right now (exposed to storefront)</td><td>Platform inventory</td><td>RESERVE, RELEASE, RESTORE, INBOUND, FREEZE</td></tr><tr><td>reserved</td><td>Held by non-terminal unpaid/pending orders (has a TTL)</td><td>Platform inventory</td><td>RESERVE, RELEASE, DEDUCT</td></tr><tr><td>frozen</td><td>Blocked from sale (QC hold, damage, channel lock)</td><td>Platform + WMS</td><td>FREEZE, UNFREEZE, ADJUST</td></tr><tr><td>sold</td><td>Cumulative deducted quantity (ledger concept, not a bucket)</td><td>Platform inventory</td><td>DEDUCT, RESTORE</td></tr><tr><td>safety_stock</td><td>Configured buffer never exposed to sale</td><td>Config</td><td>Manual config change</td></tr></tbody></table>
+<p><strong>Core invariant (asserted by every inventory test case and by the reconciliation job)</strong></p>
+<table><thead><tr><th>#</th><th>Invariant</th><th>Violation symptom</th></tr></thead><tbody><tr><td>I1</td><td>available + reserved + frozen == on_hand - safety_stock</td><td>Oversell (negative available) or phantom stock</td></tr><tr><td>I2</td><td>available &gt;= 0 and reserved &gt;= 0 and frozen &gt;= 0</td><td>Negative bucket, immediate P0</td></tr><tr><td>I3</td><td>sum(ledger.qty for type=RESERVE - type=RELEASE - type=DEDUCT) == reserved</td><td>Leaked or lost reservation</td></tr><tr><td>I4</td><td>on_hand == snapshot_on_hand + sum(RESTORE + INBOUND - DEDUCT - ADJUST_out)</td><td>Platform and WMS disagree on physical stock</td></tr><tr><td>I5</td><td>every mutation has exactly one ledger entry with a unique idempotency key</td><td>Double apply on message replay</td></tr><tr><td>I6</td><td>every reservation is resolvable: it ends in DEDUCT or RELEASE within its TTL</td><td>Stuck order / permanently frozen stock</td></tr></tbody></table>
+<p><strong>Ledger entry types and their transition</strong></p>
+<table><thead><tr><th>Type</th><th>From -&gt; To</th><th>Trigger</th><th>Idempotency key</th><th>Reversible</th></tr></thead><tbody><tr><td>RESERVE</td><td>available -&gt; reserved</td><td>Order create</td><td>order_no + sku_id + RESERVE</td><td>yes (RELEASE)</td></tr><tr><td>RELEASE</td><td>reserved -&gt; available</td><td>Cancel / timeout close / abnormal close</td><td>order_no + sku_id + RELEASE</td><td>n/a (terminal for that reservation)</td></tr><tr><td>DEDUCT</td><td>reserved -&gt; sold, on_hand -1</td><td>Payment success (WMS outbound confirm reconciles it)</td><td>pay_no + sku_id + DEDUCT</td><td>yes (RESTORE)</td></tr><tr><td>RESTORE</td><td>sold -&gt; available, on_hand +1</td><td>Return received + QC pass</td><td>rma_no + sku_id + RESTORE</td><td>no (needs new RMA)</td></tr><tr><td>FREEZE / UNFREEZE</td><td>available &lt;-&gt; frozen</td><td>Ops action, QC hold, channel lock</td><td>ticket_id + sku_id</td><td>yes</td></tr><tr><td>INBOUND</td><td>on_hand +1, available +1</td><td>WMS inbound receipt</td><td>receipt_no + sku_id</td><td>no (ADJUST to correct)</td></tr><tr><td>ADJUST</td><td>any -&gt; any (with reason code)</td><td>Reconciliation job or manual repair</td><td>recon_batch_id + sku_id + seq</td><td>no; immutable audit entry</td></tr></tbody></table>
+<p><strong>Cross-channel and multi-warehouse rules</strong></p>
+<table><thead><tr><th>Rule</th><th>Description</th><th>Test implication</th></tr></thead><tbody><tr><td>Per-warehouse allocation</td><td>An order line may be allocated from any warehouse holding stock; a partial allocation splits the line</td><td>Split shipment cases must assert per-warehouse ledger balance, not just the SKU total</td></tr><tr><td>Channel ring-fencing</td><td>Stock may be reserved per sales channel (e.g. shop vs live-stream)</td><td>A channel must not be able to consume another channel's ring-fenced stock</td></tr><tr><td>Reservation TTL ladder</td><td>Unpaid 30min -&gt; release; paid 24h unallocated -&gt; escalate to stuck-order alert</td><td>Timeout boundary cases must hit the exact boundary instant</td></tr><tr><td>Safety stock</td><td>available never exposes the buffer</td><td>Zero-stock cases must check available hits 0 while on_hand may still be &gt; 0</td></tr></tbody></table>
+<pre class="diagram">flowchart LR
+  subgraph Buckets
+    AV[available]
+    RS[reserved]
+    SO[sold]
+    FR[frozen]
+    OH[on_hand]
+  end
+  NEW((new stock)) --&gt;|INBOUND| AV
+  AV --&gt;|RESERVE| RS
+  RS --&gt;|RELEASE| AV
+  RS --&gt;|DEDUCT| SO
+  SO --&gt;|RESTORE + QC pass| AV
+  AV --&gt;|FREEZE| FR
+  FR --&gt;|UNFREEZE| AV
+  SO -.-&gt;|outbound confirm from WMS| OH
+  AV -.-&gt;|invariant: available+reserved+frozen = on_hand| OH
+  ADJ[ADJUST (recon / manual, reason-coded)] -.-&gt; AV
+  ADJ -.-&gt; OH</pre>
+<h3>M4 External Interaction Model (Storefront &lt;-&gt; WMS/SC2P)</h3>
+<p>Nine external messages, each with a direction, a transport, an idempotency key and a declared failure policy. Anything not declared here is undeclared behavior and belongs in the exception taxonomy (S5).</p>
+<p><strong>Message catalog</strong></p>
+<table><thead><tr><th>#</th><th>Direction</th><th>Message</th><th>Transport</th><th>Key fields</th><th>Idempotency key</th><th>Failure policy</th></tr></thead><tbody><tr><td>E1</td><td>Platform -&gt; WMS</td><td>SalesOrderCreate (SO push)</td><td>HTTPS POST (sync ACK) + MQ retry</td><td>so_id, order_no, lines[sku_id, qty], warehouse_hint, ship_to_hash</td><td>so_id</td><td>Retry x3 exp backoff -&gt; DLQ; order stays PAID with stuck_order alert</td></tr><tr><td>E2</td><td>WMS -&gt; Platform</td><td>AllocationAck</td><td>MQ</td><td>so_id, allocated_lines[], warehouse_code, shortage_lines[]</td><td>so_id + ack_seq</td><td>Idempotent apply; shortage triggers partial-allocation branch</td></tr><tr><td>E3</td><td>WMS -&gt; Platform</td><td>ShipNotice</td><td>MQ</td><td>so_id, packages[], tracking_no, line_qty_shipped, shipped_at</td><td>so_id + package_id</td><td>Dedup per package; unknown so_id -&gt; park + alert</td></tr><tr><td>E4</td><td>WMS -&gt; Platform</td><td>StockSnapshot (bulk)</td><td>MQ batch / SFTP nightly</td><td>sku_id, warehouse_code, on_hand, version, snapshot_ts</td><td>warehouse_code + version</td><td>Version-guarded apply; stale version ignored (never overwrites newer in-flight state)</td></tr><tr><td>E5</td><td>WMS -&gt; Platform</td><td>StockChangeEvent (delta)</td><td>MQ</td><td>sku_id, warehouse_code, delta, reason, event_ts</td><td>event_id</td><td>Out-of-order tolerance: apply by event_ts, drop older than last applied ts per SKU</td></tr><tr><td>E6</td><td>WMS -&gt; Platform</td><td>InboundReceipt</td><td>MQ</td><td>receipt_no, sku_id, qty, warehouse_code</td><td>receipt_no</td><td>Idempotent; adds to on_hand and available</td></tr><tr><td>E7</td><td>WMS -&gt; Platform</td><td>ReturnReceived + QCResult</td><td>MQ</td><td>rma_no, sku_id, qty, qc_result(PASS/FAIL), warehouse_code</td><td>rma_no + qc_seq</td><td>PASS -&gt; RESTORE; FAIL -&gt; no restore, reason logged</td></tr><tr><td>E8</td><td>Platform -&gt; WMS</td><td>CancelSO / DeliveryAddressChange</td><td>HTTPS POST</td><td>so_id, reason_code / new_address_version</td><td>so_id + action + version</td><td>Reject if WMS already shipped; platform keeps SHIPPED state</td></tr><tr><td>E9</td><td>Gateway -&gt; Platform</td><td>PaymentCallback / RefundCallback</td><td>HTTPS POST (public endpoint)</td><td>order_no, pay_no, amount, status, sign, ts, nonce</td><td>pay_no / refund_no</td><td>Verify sign + ts window + nonce; reject on mismatch, never mutate state</td></tr></tbody></table>
+<pre class="diagram">sequenceDiagram
+  participant SF as Storefront
+  participant INV as Platform Inventory
+  participant OMS as Order Service
+  participant PG as Payment Gateway
+  participant WMS as WMS/SC2P
+  SF-&gt;&gt;OMS: createOrder
+  OMS-&gt;&gt;INV: reserve(sku,qty)
+  INV--&gt;&gt;OMS: reserved (ledger RESERVE)
+  OMS--&gt;&gt;SF: PENDING_PAYMENT
+  SF-&gt;&gt;PG: pay
+  PG-&gt;&gt;OMS: PaymentCallback (pay_no, sign)
+  OMS-&gt;&gt;INV: deduct(sku,qty)
+  INV--&gt;&gt;OMS: sold (ledger DEDUCT)
+  OMS-&gt;&gt;WMS: E1 SalesOrderCreate
+  WMS--&gt;&gt;OMS: E2 AllocationAck
+  WMS--&gt;&gt;OMS: E3 ShipNotice
+  OMS--&gt;&gt;SF: SHIPPED -&gt; SIGNED
+  WMS--&gt;&gt;INV: E4 StockSnapshot / E5 StockChangeEvent
+  INV-&gt;&gt;INV: reconcile against ledger (tolerance check)</pre>
+<h4>M4.1 Interface contracts that must be frozen before test execution</h4>
+<ul><li>Signed OpenAPI/JSON-Schema for E1, E8 and E9, published to the test team and validated by contract tests.</li><li>Message schema version field on every MQ message, with a documented compatibility rule (additive only within a major version).</li><li>Published error-code dictionary shared by platform, WMS and gateway, including retryable vs non-retryable classification.</li><li>Clock-skew tolerance declared (+/-5min) and enforced identically on both sides.</li><li>A mock WMS/SC2P with a fault-injection switch per message type, so every E-case can be driven deterministically.</li></ul>
+<h3>M5 Consistency Boundaries and Reconciliation Points</h3>
+<p>The system cannot make every boundary strongly consistent, and trying to do so is what produces overselling defects. Each boundary is assigned a mode, an authoritative side, a conflict rule and a reconciliation cadence.</p>
+<p><strong>Consistency boundaries</strong></p>
+<table><thead><tr><th>#</th><th>Boundary</th><th>Mode</th><th>Authoritative side</th><th>Mechanism</th><th>Conflict rule</th></tr></thead><tbody><tr><td>C1</td><td>Order create &lt;-&gt; inventory reserve</td><td>STRONG</td><td>Platform inventory</td><td>Single transaction on the inventory row (SELECT ... FOR UPDATE / Redis-Lua atomic decrement with DB fallback)</td><td>Second concurrent request loses; available never &lt; 0</td></tr><tr><td>C2</td><td>Payment callback &lt;-&gt; order state</td><td>STRONG</td><td>Platform order service</td><td>Unique index on pay_no + state guard in the same transaction</td><td>Duplicate callback is a no-op; state machine guard wins over the callback</td></tr><tr><td>C3</td><td>Order &lt;-&gt; WMS sales order push (E1/E2)</td><td>EVENTUAL</td><td>Platform owns so_id</td><td>At-least-once delivery (synchronous ACK with MQ-backed retry) + idempotent SO apply keyed on so_id</td><td>WMS allocation is authoritative for warehouse/shortage; platform never re-pushes a live SO</td></tr><tr><td>C4</td><td>WMS ship notice &lt;-&gt; order status (E3)</td><td>EVENTUAL</td><td>WMS</td><td>Dedup on so_id + package_id</td><td>Platform must accept shipment even if the allocation ACK was lost (out-of-order tolerance)</td></tr><tr><td>C5</td><td>WMS stock &lt;-&gt; platform available (E4/E5)</td><td>EVENTUAL</td><td>WMS for on_hand, platform for available</td><td>Version-guarded snapshot apply; delta events ordered by event_ts</td><td>WMS on_hand always wins; an in-flight reservation is never canceled by a snapshot, the drift is reported instead</td></tr><tr><td>C6</td><td>Return receipt &lt;-&gt; stock restore (E7)</td><td>EVENTUAL</td><td>WMS QC result</td><td>Idempotent RESTORE keyed on rma_no + qc_seq</td><td>restore only on QC PASS and only for the received quantity</td></tr><tr><td>C7</td><td>Refund &lt;-&gt; order closure</td><td>STRONG</td><td>Platform</td><td>Unique index on refund_no + state guard</td><td>refund callback for an unknown/closed order goes to manual queue, never auto-revives the order</td></tr></tbody></table>
+<p><strong>Reconciliation points and cadence</strong></p>
+<table><thead><tr><th>Cadence</th><th>Reconciliation job</th><th>Scope</th><th>Tolerance</th><th>Action on breach</th></tr></thead><tbody><tr><td>Real time</td><td>Reservation TTL guard</td><td>reserved buckets older than TTL</td><td>0 breaches</td><td>auto RELEASE + ledger entry + metric</td></tr><tr><td>Real time</td><td>Invariant assertion (I1/I2/I5) on every write</td><td>all mutations</td><td>0 violations</td><td>reject the write; page P0</td></tr><tr><td>Every 5 min</td><td>DLQ sweep and replay</td><td>dead-letter queue</td><td>DLQ == 0 after replay</td><td>alert if DLQ &gt; 0; manual approval above 100 messages</td></tr><tr><td>Every 5 min</td><td>Stuck-order detector</td><td>orders non-terminal longer than stage SLA</td><td>&lt; 50 stuck orders</td><td>alert; auto-compensate where a safe rule exists</td></tr><tr><td>Hourly</td><td>Inventory diff job: platform (available+reserved+frozen) vs WMS (on_hand - safety_stock)</td><td>all sku x warehouse</td><td>diff ratio &lt; 0.05% per warehouse</td><td>classify A/B/C and auto-repair A, page on ratio breach</td></tr><tr><td>Nightly</td><td>Full stock snapshot reconciliation (E4) + three-way order/payment/shipment recon</td><td>all SKUs; yesterday's orders</td><td>0 unexplained diffs</td><td>generate ADJUST with recon_batch_id; publish audit report</td></tr><tr><td>Nightly</td><td>Ledger balance recon (I3/I4/I6)</td><td>whole ledger</td><td>0 unbalanced SKUs</td><td>freeze the SKU from sale + P0 alert until repaired</td></tr><tr><td>Weekly</td><td>Audit report + drift trend</td><td>all reconciliations</td><td>trend not degrading</td><td>review and tune thresholds</td></tr></tbody></table>
+<h4>M5.1 Why these modes (design rationale to defend in review)</h4>
+<ul><li>C1 is strong because an oversell is unrecoverable: you cannot un-sell 200 units of a 100-unit SKU.</li><li>C4 is eventual and must tolerate the lost-ACK case, because the physical shipment already happened; refusing the ship notice corrupts customer-visible reality.</li><li>C5 lets WMS win on on_hand but never lets a snapshot silently delete a live reservation, otherwise a bulk sync becomes an oversell machine.</li><li>C2 and C7 are strong because a duplicated payment effect moves real money and shows up as a chargeback.</li><li>Every eventual boundary carries a named reconciliation point and a numeric tolerance; a boundary without one is treated as an untested defect.</li></ul>
+<h2>2. F: Functional</h2>
+<p>Functional coverage expressed as a case tree: every case carries an id, a priority, preconditions, steps and an expected result traceable to a model.</p>
+<h3>F1 Core Happy Path and Order Acceptance</h3>
+<p>End-to-end acceptance of the models in M1 and M2. These cases must be automated as the regression spine; every later case in F2/F3 is a deviation from one of them.</p>
+<h4>F1-01 Create order: single SKU, sufficient stock in one warehouse  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>happy-path</code>, <code>inventory</code> · <strong>Traceability:</strong> <code>M1</code>, <code>M2</code>, <code>M3</code>, <code>M5/C1</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A on shelf, price 100.00, available = 10 in WH01</li><li>User U1 authenticated with a valid token</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST createOrder {skuId: SKU-A, qty: 1}</li><li>Read order status</li><li>Read inventory for SKU-A/WH01</li><li>Read the ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>HTTP 200 with order_no and status = PENDING_PAYMENT</li><li>Ledger has exactly one RESERVE entry (qty 1, key order_no+SKU-A+RESERVE)</li><li>available 10 -&gt; 9, reserved 0 -&gt; 1, on_hand unchanged at 10</li><li>Invariant I1 holds: available + reserved + frozen == on_hand - safety_stock</li></ol>
+<h4>F1-02 Create order: multiple SKUs, one warehouse, all in stock  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>happy-path</code>, <code>inventory</code> · <strong>Traceability:</strong> <code>M1</code>, <code>M3</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A available = 5, SKU-B available = 5, both in WH01</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST createOrder with 2 lines (SKU-A x2, SKU-B x1)</li><li>Read order and per-SKU inventory</li><li>Read the ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Order created in PENDING_PAYMENT with frozen unit price per line</li><li>Two RESERVE entries with distinct keys</li><li>available: A 5 -&gt; 3, B 5 -&gt; 4; invariant holds per SKU</li></ol>
+<h4>F1-03 Create order spanning two warehouses: allocation splits the lines  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>happy-path</code>, <code>multi-warehouse</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M4/E1</code>, <code>M4/E2</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A available 1 in WH01 and 4 in WH02; a single order requests qty 3</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST createOrder qty 3</li><li>Observe SO push payload to WMS</li><li>Observe allocation ACK</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Order created and reserve succeeds against the aggregate sellable view</li><li>SO push carries both candidate warehouses or an explicit allocation instruction per contract</li><li>Allocation ACK splits the line across WH01 and WH02</li><li>Per-warehouse ledger balances; aggregate reserved == 3</li></ol>
+<h4>F1-04 Cart validation: SKU taken off shelf between add-to-cart and submit  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>negative</code>, <code>cart</code> · <strong>Traceability:</strong> <code>M1</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A added to cart while on shelf</li><li>SKU-A is then off-shelved by ops</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST createOrder with the stale cart</li><li>Check order table and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Order rejected with SKU_OFF_SHELF (or documented equivalent), HTTP 4xx</li><li>No order row left in a non-terminal state and no ledger entry</li></ol>
+<h4>F1-05 Price changed between add-to-cart and submit  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>cart</code>, <code>money</code> · <strong>Traceability:</strong> <code>M1</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Cart held at price P1</li><li>Ops raises the SKU price to P2 before submit</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST createOrder</li><li>Inspect the order's frozen price and any user confirmation flag</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Behavior matches the published contract (either re-price with explicit confirm or deterministic rejection)</li><li>Order stores exactly one price, and it equals the amount charged later at payment</li><li>No silent charge above the price the shopper saw without a confirmation record</li></ol>
+<h4>F1-06 Payment success on the primary channel produces PAID plus DEDUCT  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>happy-path</code>, <code>money</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M3</code>, <code>M5/C2</code> · <strong>API / artifact:</strong> <code>POST /pay/callback</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 exists in PENDING_PAYMENT with amount 100.00</li><li>Sandbox gateway configured to return success</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Pay through the gateway</li><li>Deliver the signed callback to the platform</li><li>Read order, inventory and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Order status = PAID; OrderPaid event emitted once</li><li>Ledger has exactly one DEDUCT entry (key pay_no+SKU+ DEDUCT)</li><li>reserved 1 -&gt; 0, sold 0 -&gt; 1, on_hand 10 -&gt; 9</li><li>available unchanged by the deduct; invariant I1 still holds</li></ol>
+<h4>F1-07 Full shipment in a single package moves the order to SHIPPED  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>happy-path</code>, <code>sync</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M4/E3</code> · <strong>API / artifact:</strong> <code>MQ E3 ShipNotice</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 is PAID and allocated (TO_SHIP)</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>WMS mock emits E3 ShipNotice with one package covering all lines</li><li>Read order and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Status = SHIPPED; packages and tracking_no persisted</li><li>No second DEDUCT; sold unchanged (deduct already applied at pay)</li><li>auto-sign timer armed; platform sold reconciles with WMS outbound quantity</li></ol>
+<h4>F1-08 Partial shipment then the remaining lines completes the order  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>happy-path</code>, <code>split</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M4/E3</code> · <strong>API / artifact:</strong> <code>MQ E3 ShipNotice</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O2 has 3 lines, allocated in one warehouse</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Emit ShipNotice for line 1 only</li><li>Read status</li><li>Emit ShipNotice for lines 2 and 3</li><li>Read status</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>After the first notice status = PARTIAL_SHIPPED, packages = 1</li><li>After the second notice status = SHIPPED, packages = 2</li><li>sold equals the full ordered quantity exactly once, never more</li></ol>
+<h4>F1-09 Shopper confirms receipt: SHIPPED -&gt; SIGNED and the return window opens  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>happy-path</code> · <strong>Traceability:</strong> <code>M2</code> · <strong>API / artifact:</strong> <code>POST /api/order/confirm-receipt</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 is SHIPPED with logistics reported as delivered</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST confirmReceipt</li><li>Read order and the return window fields</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Status = SIGNED; signed_at recorded</li><li>Return window opened with the configured duration for restockable SKUs</li><li>No inventory change</li></ol>
+<h4>F1-10 Auto-sign after the logistics SLA with no shopper action  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>job</code>, <code>time-boundary</code> · <strong>Traceability:</strong> <code>M2</code> · <strong>API / artifact:</strong> <code>JOB autoSignJob</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 SHIPPED, delivered, no user action</li><li>Job clock advanced beyond the 15-day auto-sign SLA</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Run autoSignJob</li><li>Read order</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Status = SIGNED with an auto-sign marker (source = JOB, not USER)</li><li>Return window opened from the auto-sign timestamp</li><li>Idempotent: re-running the job changes nothing</li></ol>
+<h4>F1-11 Order auto-completes when the return window expires with no RMA  <code>P2</code></h4>
+<p><strong>Tags:</strong> <code>job</code> · <strong>Traceability:</strong> <code>M2</code> · <strong>API / artifact:</strong> <code>JOB returnWindowExpiryJob</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O3 SIGNED and outside the return window, no RMA created</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Run returnWindowExpiryJob</li><li>Read order</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Status = COMPLETED (terminal)</li><li>No inventory change; ledger untouched</li></ol>
+<h4>F1-12 Return journey: RMA, receipt, QC pass, refund, stock restored  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>happy-path</code>, <code>inventory</code>, <code>money</code> · <strong>Traceability:</strong> <code>M1</code>, <code>M2</code>, <code>M3</code>, <code>M5/C6</code> · <strong>API / artifact:</strong> <code>POST /api/order/rma + MQ E7</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 SIGNED inside the return window, SKU restockable</li><li>available 3, reserved 0, sold 1, on_hand 9</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST createRMA for qty 1</li><li>WMS emits E7 ReturnReceived with qc_result = PASS</li><li>Deliver the refund callback</li><li>Read order, inventory and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Ledger has exactly one RESTORE (on_hand 9 -&gt; 10, available 3 -&gt; 4, sold 1 -&gt; 0)</li><li>Order walks RETURNING -&gt; RETURNED -&gt; REFUNDED</li><li>Refund amount equals the paid amount; exactly one refund record</li><li>Invariant I1 holds after restore</li></ol>
+<h3>F2 Inventory Synchronization Scenarios</h3>
+<p>The highest-value block in this plan. Every case drives the ledger directly through a reserve/deduct/release/restore path or through a WMS message, and asserts the invariant plus the ledger, not just the API response.</p>
+<p><strong>Fault-injection matrix used by the F2 cases (mock WMS/SC2P switch)</strong></p>
+<table><thead><tr><th>Injection</th><th>Where</th><th>Expected platform behavior</th><th>How it is verified</th></tr></thead><tbody><tr><td>Drop response after server-side success</td><td>E1/E2</td><td>Retry is idempotent; only one SO applied</td><td>WMS mock call count == 1 effective apply</td></tr><tr><td>Duplicate message (same idempotency key)</td><td>E2/E3/E5/E7</td><td>Second apply is a no-op</td><td>Ledger row count unchanged</td></tr><tr><td>Reorder messages</td><td>E2 vs E3, E5 by event_ts</td><td>State machine guard decides, never crashes</td><td>Final state correct; no unhandled exception</td></tr><tr><td>Delay beyond TTL</td><td>E5/E3</td><td>Rejected and logged, no mutation</td><td>DLQ/late-msg metric increments</td></tr><tr><td>HTTP 500 / timeout</td><td>E1</td><td>Retry x3 with backoff then DLQ, stuck-order alert</td><td>Order remains PAID, alert fires within SLA</td></tr><tr><td>Stale snapshot version</td><td>E4</td><td>Ignored, never overwrites newer state</td><td>on_hand unchanged; stale-version metric increments</td></tr><tr><td>Snapshot with on_hand &lt; reserved</td><td>E4</td><td>Reservation preserved, drift raised</td><td>Recon alert; no automatic reservation deletion</td></tr></tbody></table>
+<h4>F2-01 Reserve success moves available to reserved exactly once  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>inventory</code>, <code>sync</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C1</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A/WH01: available 10, reserved 0, on_hand 10</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST createOrder qty 2</li><li>Read inventory and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>available 8, reserved 2, on_hand 10</li><li>One RESERVE ledger entry with key order_no+SKU-A+RESERVE</li><li>I1 and I5 hold; reserve_success_rate metric increments by 1</li></ol>
+<h4>F2-02 Reserve failure on insufficient available stock  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>inventory</code>, <code>negative</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C1</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A/WH01: available 1</li><li>Request qty 2</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST createOrder qty 2</li><li>Read response, order table and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Rejected with STOCK_INSUFFICIENT, HTTP 4xx, no order in a non-terminal state</li><li>Zero ledger entries created for this attempt</li><li>available stays 1, reserved stays 0, no negative bucket</li></ol>
+<h4>F2-03 Reserve failure when WMS pre-check times out (fail fast, no partial hold)  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>inventory</code>, <code>fault-injection</code> · <strong>Traceability:</strong> <code>M3</code>, <code>Q2</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Mock WMS configured to time out on the inventory pre-check (read timeout 500ms)</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST createOrder</li><li>Read response, ledger and the metric for reserve failures</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Request fails within the declared budget with a RETRYABLE_SYSTEM_ERROR code (or documented behavior)</li><li>No partial reservation and no half-written ledger entry</li><li>Metric reserve_fail{reason=timeout} increments; alert threshold observable</li></ol>
+<h4>F2-04 Deduct success after payment moves reserved to sold and reduces on_hand  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>inventory</code>, <code>money</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C2</code> · <strong>API / artifact:</strong> <code>POST /pay/callback</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 PENDING_PAYMENT, SKU-A/WH01: available 8, reserved 2, on_hand 10</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Deliver the signed payment callback</li><li>Read inventory and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>reserved 0, sold 2, on_hand 8</li><li>One DEDUCT entry keyed pay_no+SKU-A+DEDUCT</li><li>I1 holds; assume-idempotent OrderPaid emitted once</li></ol>
+<h4>F2-05 Deduct failure after money moved must be compensated, never lost  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>inventory</code>, <code>compensation</code>, <code>fault-injection</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5</code>, <code>S5</code> · <strong>API / artifact:</strong> <code>POST /pay/callback + JOB compPaidNotDeducted</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 PENDING_PAYMENT; mock WMS returns 500 on the deduct call</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Deliver the payment callback</li><li>Read order and inventory</li><li>Run the compensation sweep for paid-but-not-deducted</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Payment is accepted (money is real) and the order is PAID</li><li>The missing DEDUCT is detected by the reconciliation job within its SLA</li><li>Compensation applies the DEDUCT exactly once with an ADJUST/compensation marker and an audit entry</li><li>No double deduct after a later successful callback</li></ol>
+<h4>F2-06 Cancel an unpaid order releases the reservation exactly once  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>inventory</code>, <code>idempotency</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M3</code> · <strong>API / artifact:</strong> <code>POST /api/order/cancel</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 PENDING_PAYMENT with a live reservation of 2</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST cancelOrder</li><li>Read order, inventory and ledger</li><li>POST cancelOrder again</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Status = CANCELED; available 8 -&gt; 10, reserved 2 -&gt; 0</li><li>Exactly one RELEASE entry</li><li>The second cancel is rejected with ORDER_STATE_ILLEGAL and creates no further ledger entry</li></ol>
+<h4>F2-07 Cancel/refund a paid order before shipment applies the compensating ledger  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>inventory</code>, <code>compensation</code>, <code>money</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M3</code>, <code>S5</code> · <strong>API / artifact:</strong> <code>POST /api/order/refund</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 PAID, not yet shipped</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST refundBeforeShip with reason_code OUT_OF_STOCK</li><li>Read inventory, ledger and refund records</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Order walks PAID -&gt; REFUNDING -&gt; REFUNDED per the documented policy</li><li>Ledger compensation matches the published rule (RESTORE if stock is returned, or no restore with an explicit reason if it never left the warehouse)</li><li>Exactly one refund record; no path leaves reserved or sold double-counted</li></ol>
+<h4>F2-08 Idempotency: duplicate RESERVE for the same order creates one hold  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>idempotency</code>, <code>inventory</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C1</code> · <strong>API / artifact:</strong> <code>internal: reserve()</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 already reserved qty 2</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Replay the reserve operation with the identical idempotency key</li><li>Read inventory and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Second call returns the original result (success) rather than an error</li><li>available and reserved unchanged</li><li>Ledger row count still 1; duplicate metric increments</li></ol>
+<h4>F2-09 Idempotency: duplicate DEDUCT for the same pay_no creates one deduct  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>idempotency</code>, <code>inventory</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C2</code> · <strong>API / artifact:</strong> <code>internal: deduct()</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 already deducted via pay_no P1</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Replay the deduct with key pay_no+SKU+DEDUCT</li><li>Read inventory and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>reserved, sold and on_hand unchanged by the replay</li><li>Exactly one DEDUCT ledger row</li><li>No double reduction of on_hand (the classic silent-drift defect)</li></ol>
+<h4>F2-10 Idempotency: duplicate payment callback at the public endpoint  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>idempotency</code>, <code>money</code>, <code>callback</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M4/E9</code>, <code>M5/C2</code> · <strong>API / artifact:</strong> <code>POST /pay/callback</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 PENDING_PAYMENT</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST the identical signed callback twice, within and after the signature time window</li><li>Read order, ledger and refund state</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Exactly one transition to PAID and one DEDUCT</li><li>Both responses report success to the gateway (no harmful retry storm)</li><li>OrderPaid emitted once; no duplicate fulfillment trigger</li></ol>
+<h4>F2-11 Out-of-order: E3 ShipNotice arrives before E2 AllocationAck  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>out-of-order</code>, <code>sync</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M4/E2</code>, <code>M4/E3</code>, <code>M5/C4</code> · <strong>API / artifact:</strong> <code>MQ E3 / E2</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 is PAID with SO pushed but no allocation ACK yet</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Emit E3 ShipNotice for the full order</li><li>Then emit the delayed E2 AllocationAck</li><li>Read final state</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Platform accepts the shipment, order reaches SHIPPED, and the delayed ACK is absorbed without regressing the state</li><li>No exception, no lost message, no duplicate package record</li><li>Reconciliation shows platform sold == WMS outbound qty</li></ol>
+<h4>F2-12 Out-of-order: a StockChangeEvent older than the last applied event_ts is ignored  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>out-of-order</code>, <code>sync</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M4/E5</code>, <code>M5/C5</code> · <strong>API / artifact:</strong> <code>MQ E5 StockChangeEvent</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A last applied event_ts = T2 with on_hand 10</li><li>A delta event with event_ts = T1 arrives late</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Publish the late event</li><li>Read on_hand and the applied-version field</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>The stale event is ignored (or quarantined), on_hand stays at the T2 value</li><li>A metric/log records the discarded late event</li><li>No double-applied delta</li></ol>
+<h4>F2-13 Message delayed beyond TTL is rejected and logged, not applied  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>time-boundary</code>, <code>sync</code> · <strong>Traceability:</strong> <code>M4</code>, <code>Q3</code> · <strong>API / artifact:</strong> <code>MQ E3</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A ship notice for order O1 is held and released 48h after its business timestamp</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Publish the stale message</li><li>Read order state and the DLQ/late-message metric</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Message is not silently applied; platform follows the declared policy (reject + alert, or apply with an audit flag)</li><li>Stuck-order detector does not silently accept the late mutation without a trace</li></ol>
+<h4>F2-14 Stale bulk snapshot version must not overwrite newer in-flight state  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>sync</code>, <code>consistency</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M4/E4</code>, <code>M5/C5</code> · <strong>API / artifact:</strong> <code>MQ E4 StockSnapshot</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A current state derived from snapshot version V5; a snapshot version V3 is replayed</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Apply the V3 snapshot</li><li>Read available/on_hand/version</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>V3 is ignored; the applied version stays V5</li><li>No change to available, reserved or on_hand</li><li>stale_snapshot_ignored metric increments</li></ol>
+<h4>F2-15 Snapshot whose on_hand is lower than reserved must not silently delete a reservation  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>consistency</code>, <code>sync</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C5</code>, <code>S4</code> · <strong>API / artifact:</strong> <code>MQ E4 StockSnapshot</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A: reserved = 5, on_hand reported by a new snapshot = 3</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Apply the snapshot</li><li>Read reserved, available and the reconciliation alert</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>The reservation is preserved; the platform does not auto-release reserved stock</li><li>A consistency breach is raised (recon alert / drift record) with the affected SKU and warehouse</li><li>available is never allowed to go negative as a result of applying the snapshot</li></ol>
+<h4>F2-16 Unknown or malformed message never mutates state  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>negative</code>, <code>schema</code>, <code>sync</code> · <strong>Traceability:</strong> <code>M4</code>, <code>Q2</code>, <code>Q3</code> · <strong>API / artifact:</strong> <code>MQ all types</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Craft an E5 message with a missing required field, an unknown type, and an unsupported version</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Publish each malformed variant</li><li>Read state and the DLQ</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Each is routed to the DLQ with a reason, and no state mutation occurs</li><li>An alert fires on DLQ growth; replay after a fix applies correctly exactly once</li></ol>
+<h4>F2-17 Return receipt restores only the received quantity; duplicates are no-ops  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>idempotency</code>, <code>inventory</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M4/E7</code>, <code>M5/C6</code> · <strong>API / artifact:</strong> <code>MQ E7</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O2 SIGNED; RMA created for qty 2 of a 3-unit line</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Emit E7 with qty 2 and qc_result PASS</li><li>Replay the same E7 with the same rma_no and qc_seq</li><li>Read ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Exactly one RESTORE of qty 2; sold reduced by 2 only</li><li>The duplicate is a no-op (one RESTORE row)</li><li>The un-returned unit stays sold and is still reconcilable</li></ol>
+<h4>F2-18 Reconciliation detects a seeded drift and repairs it with an audited ADJUST  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>reconciliation</code>, <code>compensation</code> · <strong>Traceability:</strong> <code>M5</code>, <code>S4</code>, <code>S5</code>, <code>Q5</code> · <strong>API / artifact:</strong> <code>JOB inventoryDiff</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Deliberately seed a drift between the ledger and the reported on_hand for SKU-A/WH01</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Run the hourly inventory diff job</li><li>Inspect the repair, the ledger and the audit record</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Drift is detected and classified (A/B/C) per the published rule</li><li>Class-A drift is auto-repaired via an ADJUST entry carrying recon_batch_id and a reason code</li><li>Invariant I1 holds afterwards; the audit record names the job, time and delta</li></ol>
+<h4>F2-19 Reservation TTL guard releases expired reservations  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>job</code>, <code>reconciliation</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5</code> · <strong>API / artifact:</strong> <code>JOB reservationTtlGuard</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A residue reservation exists whose order has been terminal for longer than the TTL</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Run the reservation TTL guard</li><li>Read inventory and ledger</li><li>Run it a second time</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>The reservation is released exactly once with a RELEASE entry and a reason code</li><li>The second run is a no-op</li><li>reserved returns to 0 and the invariant holds</li></ol>
+<h4>F2-20 An unbalanced SKU is frozen from sale and paged, not silently traded  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>reconciliation</code>, <code>negative</code> · <strong>Traceability:</strong> <code>M3</code>, <code>Q3</code>, <code>S5</code> · <strong>API / artifact:</strong> <code>JOB ledgerBalanceRecon</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Force a ledger/quantity mismatch for SKU-A (I3 violated)</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Run the ledger balance recon</li><li>Attempt to place a new order for SKU-A</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>SKU-A is frozen from sale (not exposed as available)</li><li>A P0 page is raised with the SKU, warehouse and delta</li><li>New orders for SKU-A are rejected with a documented code instead of risking an oversell</li></ol>
+<h3>F3 Boundary, Race and Volume Scenarios</h3>
+<p>These cases create the conditions under which the models break. Races are run at least 20 times to distinguish a real defect from a lucky pass.</p>
+<h4>F3-01 Zero stock: available = 0 rejects the order without creating a negative bucket  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>boundary</code>, <code>negative</code>, <code>inventory</code> · <strong>Traceability:</strong> <code>M3</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A/WH01 available = 0 but on_hand = 5 (5 units held by safety stock or a live reservation)</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST createOrder qty 1</li><li>Read response and inventory</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Rejected with STOCK_INSUFFICIENT</li><li>available stays 0 and never goes negative</li><li>on_hand is untouched at 5, demonstrating that sellability, not physical stock, gated the order</li></ol>
+<h4>F3-02 Two concurrent submissions contend for the last unit: exactly one succeeds  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>race</code>, <code>inventory</code>, <code>oversell</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C1</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A available = 1</li><li>Two users each submit qty 1 simultaneously</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Fire both requests with a synchronized start (barrier)</li><li>Read both responses and the ledger</li><li>Repeat 20 times</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Exactly one order reaches PENDING_PAYMENT, the other is rejected with STOCK_INSUFFICIENT</li><li>available = 0, reserved = 1, on_hand = 1 after every iteration</li><li>Across all 20 runs: zero oversell, zero negative bucket</li></ol>
+<h4>F3-03 Flash sale burst: 20k QPS for 10s against 500 units  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>race</code>, <code>performance</code>, <code>oversell</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C1</code>, <code>Q1</code>, <code>S4</code> · <strong>API / artifact:</strong> <code>PUT /api/order/create (burst)</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A/WH01 on_hand = 500, available = 500, no safety stock</li><li>Load model: 200k virtual users, ramp to 20k QPS for 10s</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Execute the burst</li><li>Collect success/failure counts, inventory state and latency</li><li>Reconcile for 24h afterwards</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Exactly 500 orders succeed and 0 oversell occurs; error rate for the remainder is the documented STOCK_INSUFFICIENT rejection, not 5xx</li><li>available = 0, reserved = 0 (after all timers), sold = 500, on_hand = 0, invariant holds</li><li>No negative bucket at any sampled instant during the burst</li><li>p95 latency within the Q1 target; no 5xx storm from lock contention</li></ol>
+<h4>F3-04 Small-scale contention: 50 concurrent requests against 10 units  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>race</code>, <code>oversell</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C1</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A available = 10</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Fire 50 concurrent qty-1 orders</li><li>Read the outcome distribution</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Exactly 10 succeed and 40 receive STOCK_INSUFFICIENT</li><li>reserved = 10 exactly; available = 0</li><li>No request fails with a 5xx caused by contention handling</li></ol>
+<h4>F3-05 Quantity boundaries: zero, negative, fractional, over the per-order cap, and exactly equal to available  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>boundary</code>, <code>validation</code> · <strong>Traceability:</strong> <code>M3</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>SKU-A available = 10, max_per_order configured = 5</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Submit qty = 0, -1, 1.5, 6 and 5 (the configured cap)</li><li>Read responses, order table and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Invalid quantities are rejected by validation with a documented code and create no ledger entry</li><li>qty = 6 exceeds max_per_order -&gt; rejected with QUANTITY_LIMIT_EXCEEDED</li><li>qty = 5, exactly at the cap, succeeds and leaves available at 5 - never negative and never an off-by-one</li></ol>
+<h4>F3-06 Payment callback and the timeout-close job race at the same instant  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>race</code>, <code>money</code>, <code>boundary</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M3</code>, <code>M5/C2</code> · <strong>API / artifact:</strong> <code>POST /pay/callback + JOB paymentTimeout</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 PENDING_PAYMENT with the 30-minute deadline about to expire</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Trigger the close job and deliver the payment callback within the same second, both orders of arrival</li><li>Read the final state, the ledger and the payment record</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Exactly one of the two outcomes is applied: either PAID with a DEDUCT, or CLOSED with a RELEASE</li><li>The loser is handled explicitly: an unpaid close must not strand a real payment (it is routed to auto-refund), and a paid order must not be closed</li><li>Never a state where money was taken and the reservation was released without a refund path</li><li>Ledger has exactly one of DEDUCT or RELEASE, never both</li></ol>
+<h4>F3-07 Timeout boundary precision: 29:59 stays open, 30:01 is closed  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>boundary</code>, <code>time-boundary</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M3</code> · <strong>API / artifact:</strong> <code>JOB paymentTimeout</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Two orders created with controlled created_at values</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Run the close job at created_at + 29:59 and at + 30:01</li><li>Read both orders</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>The 29:59 order remains PENDING_PAYMENT and keeps its reservation</li><li>The 30:01 order becomes CLOSED and releases it</li><li>No off-by-one mass release of live orders</li></ol>
+<h4>F3-08 Partial shipment does not change sold quantities  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>split</code>, <code>inventory</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M3</code> · <strong>API / artifact:</strong> <code>MQ E3</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O2 PAID, three lines, all deducted</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Emit a ship notice covering one line</li><li>Read the ledger, sold and order status</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Status = PARTIAL_SHIPPED; no additional DEDUCT and no RESTORE</li><li>sold remains the full order quantity</li><li>Per-line shipped quantity tracked for later reconciliation</li></ol>
+<h4>F3-09 Split shipment across two warehouses produces two packages under one order  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>split</code>, <code>multi-warehouse</code> · <strong>Traceability:</strong> <code>M2</code>, <code>M3</code>, <code>M4/E3</code> · <strong>API / artifact:</strong> <code>MQ E3</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O3 allocated from WH01 and WH02</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Emit two ship notices, one per warehouse package</li><li>Read order, packages and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>One order, two packages, two tracking numbers, no duplicate order rows</li><li>Status reaches SHIPPED only after both packages ship</li><li>Ledger is per warehouse and balances per warehouse as well as in aggregate</li></ol>
+<h4>F3-10 Partial return restores only the returned quantity  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>boundary</code>, <code>inventory</code>, <code>return</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M4/E7</code> · <strong>API / artifact:</strong> <code>POST /api/order/rma + MQ E7</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O4 SIGNED with 3 units; sold = 3, on_hand = 7</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Create an RMA for 1 unit and emit E7 with QC PASS</li><li>Read inventory and ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>on_hand 7 -&gt; 8, available +1, sold 3 -&gt; 2</li><li>The other 2 units stay sold and remain reconcilable</li><li>Exactly one RESTORE entry with the RMA key</li></ol>
+<h4>F3-11 Return that fails QC is not restored to sellable stock  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>negative</code>, <code>return</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M4/E7</code> · <strong>API / artifact:</strong> <code>MQ E7</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O4 SIGNED; a returned unit is damaged</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Emit E7 with qc_result = FAIL</li><li>Read inventory, ledger and the reason record</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>No RESTORE occurs; sold and on_hand are unchanged</li><li>The RMA is closed with a QC_FAIL reason and an audit record</li><li>The returned physical unit is accounted for as frozen/non-sellable rather than silently lost</li></ol>
+<h4>F3-12 Duplicate return receipt for one RMA restores stock only once  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>idempotency</code>, <code>return</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C6</code> · <strong>API / artifact:</strong> <code>MQ E7</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>One RMA exists in RETURNING state</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Deliver the identical E7 message five times</li><li>Read ledger, inventory and the RMA</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Exactly one RESTORE entry; on_hand increases by the received quantity once</li><li>The extra deliveries return success but mutate nothing</li><li>available never exceeds the physically returned quantity</li></ol>
+<h4>F3-13 Oversized payload / very large order  <code>P2</code></h4>
+<p><strong>Tags:</strong> <code>boundary</code>, <code>volume</code> · <strong>Traceability:</strong> <code>M3</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Construct an order with 999 lines and with a single line of qty 99999</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Submit both</li><li>Read responses and the ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Behavior matches the published limits (accepted, or rejected with a documented size code) and is deterministic</li><li>A rejected oversized order leaves zero ledger residue and no partial reservation</li><li>If accepted, all lines are reserved atomically or not at all</li></ol>
+<h4>F3-14 Duplicate submit of the same cart (double click / retry) yields one order  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>idempotency</code>, <code>race</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C1</code>, <code>F4-02</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A valid cart with a client idempotency key</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Fire the same createOrder request 10 times concurrently with the identical key</li><li>Read the orders table, ledger and the payment intents</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Exactly one order_no is created and returned to all callers</li><li>Exactly one RESERVE and one payment intent</li><li>No duplicate reservation, therefore no leaked stock</li></ol>
+<h4>F3-15 Post-flash-sale conservation: nothing created, nothing lost  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>inventory</code>, <code>consistency</code>, <code>oversell</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5</code>, <code>S4</code> · <strong>API / artifact:</strong> <code>JOB inventoryDiff</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Flash sale of 500 units completes and all timers have run</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Read inventory, ledger and the order list</li><li>Run the conservation checks (I1, I3, I4)</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>available = 0, reserved = 0, sold = 500, on_hand = 0</li><li>Every reservation resolved into DEDUCT or RELEASE; zero orphans</li><li>Ledger sums match the bucket values exactly; the 24-hour reconciliation reports zero unexplained diff</li></ol>
+<h4>F3-16 Cancel or refund a SHIPPED order is refused by the state guard  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>negative</code>, <code>state-machine</code> · <strong>Traceability:</strong> <code>M2</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>POST /api/order/cancel</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Order O1 is SHIPPED with stock deducted</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>POST cancelOrder with reason OTHER</li><li>POST refundBeforeShip</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Both are rejected with ORDER_STATE_ILLEGAL and no inventory or money movement</li><li>The only permitted path remains the return/RMA journey</li><li>The rejection is logged with the order_no for audit</li></ol>
+<h3>F4 Critical API and Contract Validation</h3>
+<p>Contract-level coverage: request validation, error-code semantics, callback write-back fields and the boundary between what the client may assert and what the server must recompute.</p>
+<h4>F4-01 createOrder request-field validation  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>validation</code>, <code>api</code> · <strong>Traceability:</strong> <code>M1</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A contract-test harness driven from the published JSON Schema</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Submit variants: missing skuId, qty as a string, qty negative, field exceeding maxLength, illegal status enum, unknown extra field, malformed JSON, wrong content-type</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Each invalid request returns 4xx with a field-level error path and the documented code</li><li>No 5xx, no partial order, no ledger entry for any invalid request</li><li>Optional fields are absent-tolerant while required fields are strictly enforced</li></ol>
+<h4>F4-02 createOrder idempotency key is required and honoured  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>idempotency</code>, <code>api</code> · <strong>Traceability:</strong> <code>M5/C1</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Two calls, one with a missing key and one reusing a valid key</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Call without the key</li><li>Call twice with the same key but a slightly different body</li><li>Inspect orders and the ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Missing key -&gt; rejected with IDEMPOTENCY_KEY_REQUIRED (documented decision, not silent acceptance)</li><li>Same key returns the original order_no and creates no second order or reservation</li><li>Same key with a different body is rejected as a conflict rather than silently ignored</li></ol>
+<h4>F4-03 Authentication and replay protection on write APIs  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>security</code>, <code>api</code> · <strong>Traceability:</strong> <code>M4</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>all write endpoints</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Known credentials plus a captured, previously accepted request</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Replay with a missing signature, an invalid signature, a timestamp 10 minutes old, and a reused nonce</li><li>Check for any side effect</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>All rejections with 401/403 and a documented code</li><li>Zero state change and zero ledger entry for rejected calls</li><li>Timestamp and nonce windows enforced identically on platform and WMS sides</li></ol>
+<h4>F4-04 Authorization isolation between tenants/users  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>security</code>, <code>api</code> · <strong>Traceability:</strong> <code>Q4</code> · <strong>API / artifact:</strong> <code>GET/POST /api/order/*</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>User A's token and user B's order id</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Read, cancel and refund B's order with A's token</li><li>Attempt admin-only inventory adjustment with a normal user token</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>403 for every cross-user access; the resource existence is not leaked</li><li>Admin-only mutation requires the admin role and a reason code</li><li>Denials are audited</li></ol>
+<h4>F4-05 Error-code contract: business errors are 4xx with documented codes  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>api</code>, <code>negative</code> · <strong>Traceability:</strong> <code>M4</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>all endpoints</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A catalog of known business-error triggers (insufficient stock, illegal state, duplicate request, off-shelf SKU)</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Trigger each condition</li><li>Compare the returned code/message against the published dictionary</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Every business error maps to the documented code and an appropriate 4xx</li><li>No 5xx for expected business conditions</li><li>Error responses contain no stack traces, SQL, internal hostnames or PII</li></ol>
+<h4>F4-06 Client-supplied price or quantity is never trusted  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>security</code>, <code>money</code> · <strong>Traceability:</strong> <code>Q4</code> · <strong>API / artifact:</strong> <code>POST /api/order/create</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A crafted createOrder request carrying amount = 0.01 for a 100.00 SKU</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Submit the tampered request</li><li>Read the stored order amount and the payment intent</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>The server recomputes the amount from SKU and promotion rules</li><li>A tampered amount is either ignored or rejected with PRICE_MISMATCH, never honoured</li><li>The amount stored equals the amount charged in the later payment callback</li></ol>
+<h4>F4-07 Payment callback write-back contract  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>callback</code>, <code>money</code>, <code>api</code> · <strong>Traceability:</strong> <code>M4/E9</code>, <code>M5/C2</code>, <code>Q3</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>POST /pay/callback</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A signed callback template with every documented field</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Deliver an amount mismatch, an unknown order_no, a bad signature, a missing pay_no and a duplicate pay_no</li><li>Inspect order, ledger and alerts</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Amount mismatch -&gt; rejected, no state change, alert raised, callback acknowledged safely</li><li>Unknown order_no -&gt; routed to the manual/exception queue, never auto-creating an order</li><li>Bad signature -&gt; 401 with no mutation; duplicate pay_no -&gt; idempotent success</li><li>Every callback outcome is visible in a metric with the reject reason</li></ol>
+<h4>F4-08 WMS ship-notice write-back contract  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>sync</code>, <code>schema</code>, <code>api</code> · <strong>Traceability:</strong> <code>M4/E3</code>, <code>Q2</code> · <strong>API / artifact:</strong> <code>MQ E3</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A schema-valid and several schema-invalid ship notices</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Deliver: valid, missing tracking_no, illegal tracking_no format, package count not matching the shipped quantity sum, unknown so_id</li><li>Inspect order state, DLQ and alerts</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Valid notice applies fully and is idempotent per package</li><li>Invalid notices go to the DLQ with a reason and cause no state change</li><li>Unknown so_id is parked and alerted rather than creating a new order</li></ol>
+<h4>F4-09 Stock synchronization message schema and version guard  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>sync</code>, <code>schema</code> · <strong>Traceability:</strong> <code>M4/E4</code>, <code>M4/E5</code> · <strong>API / artifact:</strong> <code>MQ E4/E5</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>E4/E5 messages with a missing version field, a future-major version and a wrong type on qty</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Publish the variants</li><li>Read applied version, inventory and the DLQ</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>A missing or unsupported version is rejected rather than guessed</li><li>Type errors are rejected at the boundary with a schema-error reason</li><li>Every accepted message is recorded with its version for traceability</li></ol>
+<h4>F4-10 Query API limits and encoding  <code>P2</code></h4>
+<p><strong>Tags:</strong> <code>validation</code>, <code>security</code> · <strong>Traceability:</strong> <code>Q4</code> · <strong>API / artifact:</strong> <code>GET /api/order/list</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A large result set and adversarial inputs</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Request page_size = 0, -1, 100000; an unknown sort field; SQL/HTML fragments and emoji in address and remark; a 5,000-character remark</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Pagination is bounded by the documented cap and returns 4xx beyond it</li><li>Sort/field names are whitelisted; unknown values rejected</li><li>Unicode and emoji are stored and returned round-trip correctly; injection attempts are neutralized with no data disclosure</li></ol>
+<h4>F4-11 Cancel/refund API validation and guards  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>api</code>, <code>validation</code> · <strong>Traceability:</strong> <code>M2</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>POST /api/order/cancel</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Orders in PENDING_PAYMENT, PAID and SHIPPED states</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Cancel/refund each with: no reason code, an illegal reason code, a missing order_no, no permission</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>State guard runs before any side effect</li><li>Reason code is validated against an enum and persisted</li><li>Permission failures return 403 without revealing order details</li></ol>
+<h4>F4-12 Sensitive-data masking in responses, logs and messages  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>security</code>, <code>privacy</code> · <strong>Traceability:</strong> <code>M4</code>, <code>Q4</code>, <code>Q5</code> · <strong>API / artifact:</strong> <code>all endpoints + logs</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>An order carrying a full phone number, a detailed address and an ID number</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Read the order via the API, the admin console and a raw log export; inspect the SO push payload and MQ messages</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Storefront/admin responses mask phone and ID; the full value is returned only to an authorized owner in an approved field</li><li>Logs contain no unmasked PII (verified by a log scan in CI)</li><li>Outbound WMS messages carry only the fields the warehouse needs, not the full customer record</li></ol>
+<h4>F4-13 No internal-field leakage from storefront responses  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>api</code>, <code>security</code> · <strong>Traceability:</strong> <code>M4</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>GET /api/order/detail</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A normal order plus an order in an internal failure state</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Diff the response payload against the public contract schema</li><li>Search responses for internal keys</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>No cost price, supplier id, raw WMS payload, internal flags or exception stack appears</li><li>Contract tests fail the build when a non-contracted field is added</li></ol>
+<h2>3. Q: Quality</h2>
+<p>Non-functional risk control: measurable targets, parameterised mechanisms, and drills with explicit targets.</p>
+<h3>Q1 Performance</h3>
+<p>Every target is stated as a number under a specific traffic shape, so it is measurable rather than descriptive. The controlling constraint is the flash-sale profile: high contention against small inventory.</p>
+<p><strong>Performance targets (must be met at 1.5x the projected peak)</strong></p>
+<table><thead><tr><th>Transaction</th><th>Load profile</th><th>Throughput target</th><th>Latency (p95 / p99)</th><th>Error budget</th><th>Notes</th></tr></thead><tbody><tr><td>createOrder</td><td>Steady 2h</td><td>2,000 TPS sustained</td><td>&lt;= 200ms / &lt;= 500ms</td><td>&lt;= 0.1% 5xx (business rejections excluded)</td><td>Contention path: single-row inventory update</td></tr><tr><td>createOrder (flash sale)</td><td>10s burst</td><td>20,000 QPS peak</td><td>&lt;= 1s / &lt;= 3s</td><td>&lt;= 0.5% non-business errors</td><td>Oversell must remain exactly 0 at any error rate</td></tr><tr><td>Payment callback</td><td>Steady 30min</td><td>3,000 TPS</td><td>&lt;= 150ms / &lt;= 400ms</td><td>&lt;= 0.01%</td><td>Public endpoint, must absorb gateway retries</td></tr><tr><td>Inventory read (sellable qty)</td><td>Steady 30min</td><td>10,000 QPS</td><td>&lt;= 50ms / &lt;= 120ms</td><td>&lt;= 0.1%</td><td>Cache must not serve stale availability at the moment of reserve</td></tr><tr><td>Stock sync consumption (E4/E5)</td><td>Bulk drain</td><td>&gt;= 50,000 msg/min</td><td>consumer lag &lt;= 30s</td><td>0 message loss</td><td>Backlog must not exceed 10k at any sample</td></tr><tr><td>End-to-end order to SHIPPED (async)</td><td>Mixed soak</td><td>n/a</td><td>p95 &lt;= 5min of business time</td><td>n/a</td><td>Excludes WMS human pick time; measures platform-side latency only</td></tr></tbody></table>
+<p><strong>Load model and pass conditions</strong></p>
+<table><thead><tr><th>Test</th><th>Shape</th><th>Duration</th><th>Pass condition</th></tr></thead><tbody><tr><td>Baseline</td><td>1x projected peak</td><td>30min</td><td>All latency targets met; resource headroom &gt;= 40%</td></tr><tr><td>Peak</td><td>1.5x projected peak</td><td>30min hold after 2h ramp</td><td>Latency and error targets met; no queue growth trend</td></tr><tr><td>Burst (flash sale)</td><td>Step to 20k QPS in 1s, fresh 500-unit SKU per cycle</td><td>10s, repeated 20 times</td><td>Zero oversell; no negative bucket; exactly 500 successes in the first cycle and every later attempt rejected with STOCK_INSUFFICIENT; baseline latency recovered within 60s</td></tr><tr><td>Soak</td><td>1.2x peak</td><td>8h</td><td>No memory leak (RSS growth &lt; 5%), no connection leak, GC pauses bounded, error rate stable</td></tr><tr><td>Breakpoint</td><td>Ramp to failure</td><td>Until knee</td><td>The system degrades by rejecting business requests, not by corrupting state: zero invariant violations at the knee</td></tr><tr><td>Sync surge</td><td>10x normal stock events</td><td>15min</td><td>Consumer lag recovers to &lt;= 30s within 15min after the surge ends</td></tr></tbody></table>
+<h4>Q1-01 Flash-sale burst causes zero oversell and zero invariant violation  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>performance</code>, <code>oversell</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5/C1</code>, <code>F3-03</code>, <code>S4</code> · <strong>API / artifact:</strong> <code>PUT /api/order/create (burst)</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Perf environment, 500-unit SKU, load generator ready with a synchronized start</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Execute 20 x 10s bursts at 20k QPS</li><li>Continuously sample available/reserved/sold and the latency histogram</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>No sample shows a negative bucket or available + reserved + frozen != on_hand - safety_stock</li><li>Exactly 500 orders succeed; every later attempt in the same cycle is rejected with STOCK_INSUFFICIENT, never a 5xx</li><li>Error responses are business rejections, not 5xx; latency targets met</li></ol>
+<h4>Q1-02 Sustained peak does not degrade into a queue collapse  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>performance</code> · <strong>Traceability:</strong> <code>M5</code>, <code>Q3</code> · <strong>API / artifact:</strong> <code>mixed</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Perf environment at production-like topology</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>2h ramp to 1.5x peak, 30min hold</li><li>Track queue depth, consumer lag and p99 over time</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Latency and error targets hold for the whole hold period</li><li>No monotonic growth in backlog or thread pool saturation</li><li>Auto-scaling (if configured) stabilizes without flapping</li></ol>
+<h4>Q1-03 Eight-hour soak shows no leak and no slow drift  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>performance</code>, <code>soak</code> · <strong>Traceability:</strong> <code>Q3</code>, <code>Q5</code> · <strong>API / artifact:</strong> <code>mixed</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>1.2x peak, steady mixed traffic with sync traffic included</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Run 8h</li><li>Sample RSS, GC pauses, connection pool, ledger/DB growth, inventory divergence hourly</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Memory growth bounded (&lt; 5%); no FD/connection leak</li><li>Inventory diff does not grow with time</li><li>Error rate and latency stable between hour 1 and hour 8</li></ol>
+<h4>Q1-04 Breakpoint behavior fails closed, never corrupts  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>performance</code>, <code>resilience</code> · <strong>Traceability:</strong> <code>M3</code>, <code>Q2</code> · <strong>API / artifact:</strong> <code>mixed</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Ramp load past the system knee</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Increase load until the system degrades</li><li>Inspect state and error taxonomy at the knee</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Degradation appears as explicit business/system rejections with retryable codes</li><li>Zero state corruption: no oversell, no negative bucket, no partial ledger entry</li><li>Recovery to normal latency without a restart once load recedes</li></ol>
+<h3>Q2 Reliability</h3>
+<p>Reliability is specified as concrete mechanisms with parameters, together with the chaos scenarios that exercise them. The order/inventory boundary is designed to be at-least-once and idempotent, so 'exactly once' is never assumed anywhere.</p>
+<p><strong>Reliability mechanisms and parameters</strong></p>
+<table><thead><tr><th>Mechanism</th><th>Applies to</th><th>Parameters</th><th>Test assertion</th></tr></thead><tbody><tr><td>Retry</td><td>All outbound calls (E1, E8) and all consumers</td><td>Max 3 attempts, exponential backoff 1s/4s/16s with jitter; only idempotent operations retried</td><td>Retries never produce a second effect; attempt count visible in metrics</td></tr><tr><td>Timeout</td><td>Outbound HTTP and DB</td><td>Connect 1s, read 3s; reserve fail-fast budget 500ms</td><td>Timeout produces a documented retryable error, not a hang; no thread starvation under a slow dependency</td></tr><tr><td>Circuit breaker</td><td>WMS/SC2P and payment gateway clients</td><td>Open when error rate &gt; 50% over a 20s window; open for 30s; half-open probe 1 request</td><td>During a WMS outage, order creation degrades predictably (fail fast or queue per policy) instead of stalling</td></tr><tr><td>Bulkhead</td><td>Order, inventory and sync thread/connection pools</td><td>Isolated pools per dependency</td><td>A WMS slowdown must not exhaust the pool used by payment callbacks</td></tr><tr><td>Fallback / degradation</td><td>Sellable-quantity read path</td><td>Serve last-known-good with an explicit staleness marker; never invent availability</td><td>No stale read is allowed to authorize a reserve that violates the invariant</td></tr><tr><td>Compensation jobs</td><td>Five known drift classes (see S5)</td><td>Scheduled sweep with per-class SLA and idempotency key</td><td>Each seeded drift is detected and repaired exactly once within its SLA</td></tr><tr><td>DLQ and replay</td><td>All MQ consumers</td><td>Dead-letter with reason; replay requires approval above 100 messages</td><td>Replay after a fix applies correctly and only once</td></tr><tr><td>Message ordering</td><td>E5 delta events</td><td>Per-SKU monotonic apply by event_ts</td><td>Late events are discarded; state matches the newest event</td></tr><tr><td>Clock discipline</td><td>Signature validation on both sides</td><td>NTP-synced; skew tolerance +/-5min</td><td>A 6-minute skew is rejected; a 4-minute skew is accepted</td></tr></tbody></table>
+<p><strong>Chaos and recovery drills (run in TEST/STAGE before release)</strong></p>
+<table><thead><tr><th>#</th><th>Chaos scenario</th><th>Injected fault</th><th>Expected behavior</th><th>Recovery target</th></tr></thead><tbody><tr><td>CH1</td><td>WMS/SC2P unavailable</td><td>Block traffic for 30min</td><td>Orders fail fast or queue per policy; no state corruption; alerts fire; after restore, backlog drains and reconciliation is clean</td><td>Backlog drained &lt;= 30min after restore</td></tr><tr><td>CH2</td><td>MQ broker restart</td><td>Kill the broker mid-flight</td><td>No message loss for persisted messages; consumers resume; duplicates are absorbed idempotently</td><td>&lt;= 10min</td></tr><tr><td>CH3</td><td>Redis / cache loss</td><td>Flush the inventory cache</td><td>Cache rebuilds from the ledger; no oversell during the rebuild window</td><td>&lt;= 5min</td></tr><tr><td>CH4</td><td>Database primary failover</td><td>Promote a replica</td><td>At most the transaction in flight is lost; no partially applied ledger entry</td><td>RTO &lt;= 15min, RPO = 0 for order/payment</td></tr><tr><td>CH5</td><td>Clock skew</td><td>Skew one node by 6 minutes</td><td>Signature validation rejects out-of-window messages with a clear reason; no silent data loss</td><td>Immediate</td></tr><tr><td>CH6</td><td>Slow dependency</td><td>Add 5s latency to the WMS client</td><td>Circuit breaker opens; order creation fails fast instead of timing out under load</td><td>&lt;= 30s to degrade cleanly</td></tr><tr><td>CH7</td><td>Duplicate delivery storm</td><td>Replay 10% of the day's messages</td><td>All duplicates are no-ops; no drift; ledger row count unchanged</td><td>Immediate</td></tr><tr><td>CH8</td><td>Partial batch failure</td><td>Fail half of a 1,000-message bulk sync batch</td><td>Successful half applies; failed half lands in the DLQ and is replayable</td><td>&lt;= 15min</td></tr></tbody></table>
+<h4>Q2-01 Seeded drift classes are all detected and compensated within SLA  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>compensation</code>, <code>reliability</code> · <strong>Traceability:</strong> <code>M5</code>, <code>S5</code>, <code>Q3</code>, <code>F2-18</code> · <strong>API / artifact:</strong> <code>JOB compensationSweep</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Five deliberate drifts seeded: paid-but-not-deducted, shipped-but-not-deducted, closed-but-reservation-alive, return-received-but-not-restored, lost callback</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Start the compensation scheduler</li><li>Track detection time, repair time and the ledger entries produced</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>All five are detected within the declared window and repaired exactly once</li><li>Each repair leaves an ADJUST/compensation ledger entry with a reason code and batch id</li><li>Invariants I1, I3 and I4 hold after the sweep; no drift recurs</li></ol>
+<h4>Q2-02 Circuit breaker and fail-fast under a WMS outage  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>reliability</code>, <code>fault-injection</code> · <strong>Traceability:</strong> <code>M4</code>, <code>Q1</code>, <code>Q3</code> · <strong>API / artifact:</strong> <code>mixed</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>WMS mock switchable to an outage</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Take the WMS down</li><li>Drive normal order traffic for 10min</li><li>Restore the WMS and observe recovery</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Circuit opens within the declared window; order creation returns the documented retryable/queue response rather than hanging</li><li>Payment callbacks continue to be processed (bulkhead verified)</li><li>After restore, the breaker closes, the backlog drains and reconciliation reports zero unexplained diff</li></ol>
+<h4>Q2-03 Timeout and retry produce no duplicate effect  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>reliability</code>, <code>idempotency</code> · <strong>Traceability:</strong> <code>M4</code>, <code>F2-09</code> · <strong>API / artifact:</strong> <code>E1 / reserve()</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A dependency configured to accept the request and then time out on the response</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Trigger the retry path for E1 (SO push) and for the reserve call</li><li>Compare the effective apply count on the dependency with the platform ledger</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>The dependency applies the operation once; the platform ledger matches</li><li>Retry attempts and outcomes are visible in metrics; the DLQ is empty after the fixed path is used</li></ol>
+<h4>Q2-04 Message-order guarantees hold under a reordering storm  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>reliability</code>, <code>out-of-order</code> · <strong>Traceability:</strong> <code>M4</code>, <code>M5/C4</code>, <code>F2-11</code>, <code>F2-12</code> · <strong>API / artifact:</strong> <code>MQ</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A stream of E5 events plus E2/E3 pairs shuffled with duplicates</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Publish 10,000 shuffled messages with 10% duplicates</li><li>Compare final state with the expected final state computed from the source of truth</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Final state matches the expectation exactly</li><li>Duplicates and reordered messages leave no residue</li><li>DLQ is empty and the late-message metric reflects the discarded stale events only</li></ol>
+<h3>Q3 Observability</h3>
+<p>Each consistency guarantee is backed by a metric, an owning team and an alert, surfaced on a dashboard. Every metric below carries an owner, a threshold and an action, so the on-call runbook is testable.</p>
+<p><strong>Required metrics</strong></p>
+<table><thead><tr><th>Metric</th><th>Owner</th><th>Definition</th><th>Why it exists</th><th>Alert threshold</th></tr></thead><tbody><tr><td>inventory_diff_ratio</td><td>WMS integration</td><td>Absolute difference between platform(available+reserved+frozen) and WMS(on_hand - safety_stock), divided by WMS(on_hand), per warehouse</td><td>The single best indicator that sync has silently broken</td><td>&gt; 0.05% for 5min (P1); &gt; 0.5% (P0)</td></tr><tr><td>oversell_count</td><td>Inventory platform</td><td>Number of times available went below 0 or an order was accepted beyond stock</td><td>Money-loss guard</td><td>&gt; 0 always (P0 page)</td></tr><tr><td>reserve_success_rate</td><td>Inventory platform</td><td>Successful reserves / attempts, with reason breakdown</td><td>Distinguishes real contention from a broken dependency</td><td>&lt; 95% outside a flash sale (P1)</td></tr><tr><td>deduct_lag_p99</td><td>Order platform</td><td>Payment success to deduct applied</td><td>Leading indicator of drift</td><td>&gt; 60s (P1)</td></tr><tr><td>mq_backlog / consumer_lag</td><td>SRE on-call</td><td>Pending messages per topic</td><td>Sync stall detection</td><td>&gt; 10,000 or lag &gt; 60s for 10min (P1)</td></tr><tr><td>dlq_size</td><td>WMS integration</td><td>Dead-letter depth by reason</td><td>Contract violations and bugs</td><td>&gt; 0 (P2); &gt; 100 (P1)</td></tr><tr><td>stuck_order_count</td><td>Order platform</td><td>Non-terminal orders older than their stage SLA, by stage</td><td>Customer-facing failure</td><td>&gt; 50 (P2); &gt; 200 (P1)</td></tr><tr><td>callback_fail_rate</td><td>Payments integration</td><td>Rejected callbacks by reason</td><td>Credential, signature or contract breakage</td><td>&gt; 1% for 5min (P1)</td></tr><tr><td>comp_job_success_rate</td><td>SRE on-call</td><td>Compensation jobs that repaired within SLA / attempts</td><td>Whether the safety net works</td><td>&lt; 99% (P1)</td></tr><tr><td>order_state_duration</td><td>Order platform</td><td>Histogram of time in each state</td><td>Finds the stage where reality stalls</td><td>p99 &gt; 3x baseline (P2)</td></tr><tr><td>late_msg_discarded</td><td>WMS integration</td><td>Messages dropped as stale</td><td>Proves the ordering guard is real and not silently dropping live data</td><td>Sudden spike (P2, investigate)</td></tr><tr><td>ledger_balance_violations</td><td>Inventory platform</td><td>Invariant failures at write time</td><td>Last line of defense for inventory truth</td><td>&gt; 0 always (P0 page)</td></tr></tbody></table>
+<p><strong>Alerts, severity and required action</strong></p>
+<table><thead><tr><th>Alert</th><th>Severity</th><th>Trigger</th><th>First action</th></tr></thead><tbody><tr><td>Oversell detected</td><td>P0</td><td>oversell_count &gt; 0</td><td>Page on-call; freeze the SKU from sale; open an incident; start the drift repair runbook (S5)</td></tr><tr><td>Inventory diff breach</td><td>P0/P1</td><td>diff ratio over threshold</td><td>Identify the warehouse and SKU set; run the hourly recon out of band; decide auto-repair vs manual</td></tr><tr><td>Deduct lag</td><td>P1</td><td>deduct_lag_p99 &gt; 60s</td><td>Check the WMS deduct endpoint and the compensation sweep; verify no paid-but-not-deducted backlog</td></tr><tr><td>Sync backlog</td><td>P1</td><td>backlog &gt; 10k for 10min</td><td>Check consumer health and the broker; scale consumers; verify no DLQ growth</td></tr><tr><td>Stuck orders</td><td>P2</td><td>stuck_order_count &gt; 50</td><td>Group by stage; run the stage-specific compensation job; identify the blocked dependency</td></tr><tr><td>DLQ growth</td><td>P1/P2</td><td>dlq_size &gt; 0 / &gt; 100</td><td>Inspect reasons; fix the contract break; replay with approval</td></tr><tr><td>Ledger invariant violation</td><td>P0</td><td>any I1/I2/I5 failure</td><td>Reject the write, page, freeze the SKU, escalate to the data-repair runbook</td></tr><tr><td>Callback auth failures</td><td>P1</td><td>callback_fail_rate &gt; 1%</td><td>Check key rotation and the timestamp window; confirm no credential drift between sides</td></tr></tbody></table>
+<p><strong>Logging, tracing and audit requirements</strong></p>
+<table><thead><tr><th>Requirement</th><th>Detail</th></tr></thead><tbody><tr><td>Structured logs</td><td>JSON with trace_id, order_no, sku_id, warehouse_code, message_id, idempotency_key, latency; no PII (verified by a CI log scan)</td></tr><tr><td>Ledger as first-class log</td><td>Every inventory mutation is an immutable ledger row with before/after values, source (API/MQ/JOB), reason code and operator for manual work</td></tr><tr><td>Distributed tracing</td><td>One trace spans createOrder -&gt; reserve -&gt; payment callback -&gt; deduct -&gt; SO push -&gt; ship notice, so out-of-order cases are diagnosable</td></tr><tr><td>Correlation on messages</td><td>The WMS message_id and the platform order_no appear together in logs on both sides of every boundary</td></tr><tr><td>Dashboards</td><td>Business funnel (order/pay/ship/sign), sync health (backlog, diff ratio, DLQ), compensation board (drift by class, MTTR), peak-load board (QPS, p99, error taxonomy)</td></tr><tr><td>Audit trail</td><td>Every manual repair records operator, ticket, before/after, reason code and a reversal path; adjustments are never a raw UPDATE</td></tr><tr><td>Retention and queryability</td><td>Metrics 13 months, traces 7 days, ledger indefinite, audit indefinite</td></tr></tbody></table>
+<h4>Q3-01 Every alert in the catalog fires on a synthetically injected condition  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>observability</code>, <code>alerts</code> · <strong>Traceability:</strong> <code>M5</code>, <code>Q2</code> · <strong>API / artifact:</strong> <code>monitoring</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Alert rules deployed to the test environment with the production thresholds</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Inject each condition in turn (oversell simulation, sync stall, DLQ growth, stuck orders, lag)</li><li>Measure detection latency and check the notification content</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Each alert fires within its declared detection window with the correct severity</li><li>The payload names the SKU/warehouse/order and links to the relevant dashboard</li><li>No alert storm: a single incident produces one notification per severity, not per event</li></ol>
+<h4>Q3-02 Inventory diff ratio reflects a real divergence within one cycle  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>observability</code>, <code>reconciliation</code> · <strong>Traceability:</strong> <code>M5</code>, <code>S4</code> · <strong>API / artifact:</strong> <code>JOB inventoryDiff</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A synthetic divergence of 0.1% introduced for one warehouse</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Wait for the hourly diff job</li><li>Read the metric, the alert and the report</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>The metric reports the divergence within the declared cadence</li><li>The alert fires at the configured threshold</li><li>The report lists the SKUs and deltas for triage</li></ol>
+<h4>Q3-03 Trace continuity across the storefront-WMS boundary  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>observability</code>, <code>trace</code> · <strong>Traceability:</strong> <code>M4</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>mixed</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A single order driven end-to-end with the WMS mock</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Collect the trace ids for createOrder, reserve, callback, deduct, SO push, ship notice</li><li>Check the logs on both sides</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>One searchable correlation id links the whole journey</li><li>Out-of-order arrivals are visible in the trace with timestamps proving the sequence</li><li>No PII appears in the traced payloads</li></ol>
+<h4>Q3-04 Stuck-order detection covers every non-terminal stage  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>observability</code>, <code>job</code> · <strong>Traceability:</strong> <code>M2</code>, <code>Q3</code> · <strong>API / artifact:</strong> <code>JOB stuckOrderDetector</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>One order artifically stalled in each non-terminal state</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Run the stuck-order detector</li><li>Read the grouped report</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Every stalled order is reported with its stage and dwell time</li><li>Grouping by stage matches the injected set exactly (no false negatives)</li><li>Alerts respect the threshold and do not fire on healthy orders</li></ol>
+<h3>Q4 Security</h3>
+<p>The order/inventory surface is where money and personal data meet, so the tests target authorization boundaries, callback authenticity, price tampering and PII exposure rather than generic vulnerability scanning.</p>
+<p><strong>Security requirements and verification</strong></p>
+<table><thead><tr><th>Area</th><th>Requirement</th><th>Verification</th></tr></thead><tbody><tr><td>Authentication</td><td>HMAC-SHA256 request signing plus timestamp (+/-5min) and a single-use nonce for all write APIs; mTLS between platform and WMS where supported</td><td>Replay, skew and tamper tests return 401/403 with no side effect (F4-03)</td></tr><tr><td>Authorization</td><td>RBAC with tenant isolation; inventory ADJUST and refunds are privileged operations</td><td>Cross-user and cross-role access attempts all return 403 (F4-04); privileged ops require two-person approval above a configured quantity</td></tr><tr><td>Sensitive data</td><td>Phone, name, address and ID encrypted at rest; masked in logs, dashboards, storefront responses and error messages; never in metrics labels</td><td>Automated PII scan of logs and responses in CI (F4-12)</td></tr><tr><td>Price and quantity integrity</td><td>Server-side recomputation of amount; client values are advisory only</td><td>Tampered amount is rejected or ignored, never charged (F4-06)</td></tr><tr><td>Input safety</td><td>Parameterized queries, output encoding, whitelisted sort/fields, size limits on address/remark</td><td>Injection and oversized-input suite passes with no data disclosure (F4-10)</td></tr><tr><td>Idempotency as anti-abuse</td><td>Idempotency keys prevent duplicate orders; rate limiting on order create and coupon endpoints</td><td>Duplicate-submit storm yields one order (F3-14); rate limiter returns 429 without affecting legitimate users</td></tr><tr><td>Secrets</td><td>Keys in a secret store, rotated on a schedule, never in code, config or logs; per-environment keys</td><td>Rotation test: both sides accept the new key after rotation with no downtime; no secret appears in the repo or logs</td></tr><tr><td>Audit and non-repudiation</td><td>Every state change and every manual adjustment is attributable</td><td>Audit query returns operator, ticket, before/after for each manual repair</td></tr><tr><td>Dependency exposure</td><td>Known-CVE scan of images and dependencies gates the release</td><td>No high/critical CVEs with an available fix at release time</td></tr></tbody></table>
+<h4>Q4-01 Callback authenticity cannot be bypassed  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>security</code>, <code>callback</code> · <strong>Traceability:</strong> <code>M4/E9</code> · <strong>API / artifact:</strong> <code>POST /pay/callback</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>Captured valid callbacks plus a signing key in the test store</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Attempt: no signature, wrong key, tampered amount, replayed nonce, expired timestamp, body/header mismatch</li><li>Inspect state after each attempt</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Every attempt is rejected with no state mutation and an audit log entry</li><li>The rejection reason distinguishes auth failure from contract failure</li><li>Legitimate callbacks continue to succeed during the attack window (no denial of service from the guard)</li></ol>
+<h4>Q4-02 Privileged inventory adjustment requires authorization and leaves an audit trail  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>security</code>, <code>inventory</code>, <code>audit</code> · <strong>Traceability:</strong> <code>M3</code>, <code>Q4</code> · <strong>API / artifact:</strong> <code>POST /api/inventory/adjust</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A normal user token and an admin token</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Attempt an ADJUST with the normal token</li><li>Perform one with the admin token and a reason code</li><li>Query the audit trail</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Normal token -&gt; 403 with no change</li><li>Admin adjustment adds a ledger row with operator, ticket, reason and before/after values</li><li>A reversal produces a second auditable entry rather than deleting the first</li></ol>
+<h4>Q4-03 No PII in logs, metrics or outbound messages  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>security</code>, <code>privacy</code>, <code>observability</code> · <strong>Traceability:</strong> <code>M4</code>, <code>Q3</code> · <strong>API / artifact:</strong> <code>logs + MQ</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>An order carrying a full phone number, address and ID</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Drive the full journey</li><li>Scan logs, metric labels, traces and all outbound WMS/gateway payloads</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Zero unmasked PII occurrences (regex plus a checksum-based scan for ID numbers)</li><li>The outbound WMS message contains only warehouse-relevant fields</li><li>The CI gate fails the build if the scan regresses</li></ol>
+<h4>Q4-04 Release gate: dependency and image scan  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>security</code>, <code>release</code> · <strong>Traceability:</strong> <code>Q5</code> · <strong>API / artifact:</strong> <code>CI pipeline</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>The release candidate images and the SBOM</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Run the CVE scan and the secrets scan</li><li>Review the findings</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>No high/critical vulnerability with an available fix ships with the release</li><li>No secret or key material is present in the repository or the image layers</li><li>Findings are recorded with an owner and an accepted-risk decision where deferred</li></ol>
+<h3>Q5 Recoverability</h3>
+<p>Recoverability is verified through drills with explicit targets rather than left to written procedures alone. Each drill has a target and each repair path has one tested procedure.</p>
+<p><strong>Failure drills and targets</strong></p>
+<table><thead><tr><th>Drill</th><th>Scenario</th><th>Target</th><th>Evidence required</th></tr></thead><tbody><tr><td>D1</td><td>Database primary failure and promotion</td><td>RTO &lt;= 15min, RPO = 0 for order and payment data</td><td>Order count and ledger sums identical before and after; no partially applied entry</td></tr><tr><td>D2</td><td>Point-in-time restore into a sandbox</td><td>Restore the latest backup and replay to a chosen timestamp</td><td>Sandbox totals match the production report for that timestamp; documented restore duration</td></tr><tr><td>D3</td><td>Full WMS outage of 4 hours</td><td>No order or inventory corruption; all messages recovered or explicitly rejected</td><td>Zero unexplained diff after recovery; DLQ drained or triaged</td></tr><tr><td>D4</td><td>Cache and session loss</td><td>Inventory correctness preserved with the cache cold</td><td>No oversell during the rebuild window; latency recovers within 5min</td></tr><tr><td>D5</td><td>Release rollback</td><td>Roll back the last release within the window</td><td>Schema-compatible rollback verified; feature flags allow a behavioral rollback without a deploy</td></tr><tr><td>D6</td><td>Stock recalibration</td><td>Recalibrate the platform view from the WMS source of truth</td><td>ADJUST ledger entries with reason RECALIBRATION; invariants hold; an approval record exists</td></tr><tr><td>D7</td><td>Ledger rebuild for one SKU</td><td>Rebuild the SKU's quantities from the ledger</td><td>Rebuilt values match the pre-computed expectation; the SKU returns from frozen to sellable</td></tr></tbody></table>
+<p><strong>Data-repair process (one procedure, three classes)</strong></p>
+<table><thead><tr><th>Step</th><th>Action</th><th>Owner</th><th>SLA</th></tr></thead><tbody><tr><td>1 Detect</td><td>A reconciliation job or an alert identifies a divergence (never a customer complaint)</td><td>Automated</td><td>Per cadence in M5</td></tr><tr><td>2 Classify</td><td>Class A: safe to auto-repair (e.g. a lost RELEASE). Class B: semi-automatic, needs a human approval. Class C: manual investigation (money or PII involved)</td><td>On-call</td><td>&lt;= 30min from detection</td></tr><tr><td>3 Contain</td><td>Freeze the affected SKU from sale if the divergence could cause an oversell; stop the affected job if it is amplifying the drift</td><td>On-call</td><td>Immediate for Class C</td></tr><tr><td>4 Repair</td><td>Apply the correction as an ADJUST ledger entry with a reason code and a batch id. Never a raw UPDATE. Idempotent and replayable</td><td>Automated for A, on-call for B/C</td><td>A &lt;= 1h, B &lt;= 4h, C &lt;= 24h</td></tr><tr><td>5 Verify</td><td>Re-run the invariant checks and the reconciliation; confirm the diff ratio returns below tolerance</td><td>On-call</td><td>&lt;= 1h after repair</td></tr><tr><td>6 Record</td><td>Audit entry with operator, ticket, before/after, reason and a reversal path; post-mortem for Class B/C</td><td>On-call</td><td>&lt;= 24h</td></tr></tbody></table>
+<h4>Q5-01 Database failover loses no order and no ledger entry  <code>P0</code></h4>
+<p><strong>Tags:</strong> <code>recoverability</code>, <code>drill</code> · <strong>Traceability:</strong> <code>M3</code>, <code>Q2</code>, <code>S5</code> · <strong>API / artifact:</strong> <code>drill D1</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A production-like environment with a replica and the failover mechanism configured</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Sustain order and payment traffic</li><li>Kill the primary mid-flight</li><li>Let the failover complete, then compare state</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>RTO within target; order and payment RPO = 0</li><li>No partially applied ledger entry and no orphan reservation</li><li>Invariants hold after recovery; the reconciliation reports zero unexplained diff</li></ol>
+<h4>Q5-02 Point-in-time restore reproduces known totals  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>recoverability</code>, <code>drill</code> · <strong>Traceability:</strong> <code>Q5</code> · <strong>API / artifact:</strong> <code>drill D2</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A backup plus an agreed reference timestamp and its reported totals</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Restore into a sandbox and replay to the reference timestamp</li><li>Compare orders, payments and ledger sums</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Totals match the reference report exactly</li><li>Restore duration is recorded against the target</li><li>The procedure is executable by an on-call engineer from the runbook alone (no tribal knowledge)</li></ol>
+<h4>Q5-03 Stock recalibration from the WMS source of truth is safe and audited  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>recoverability</code>, <code>inventory</code>, <code>audit</code> · <strong>Traceability:</strong> <code>M3</code>, <code>M5</code>, <code>S5</code> · <strong>API / artifact:</strong> <code>drill D6</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>A deliberately divergent SKU/warehouse</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Run the recalibration procedure with an approval record</li><li>Inspect the ledger, invariants and the SKU's sellable state</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Divergence is corrected with reason-coded ADJUST entries carrying the batch id</li><li>Invariants hold; the SKU returns to sellable if previously frozen</li><li>The approval record names the approver and the ticket</li></ol>
+<h4>Q5-04 Rollback of a release is verified, not assumed  <code>P1</code></h4>
+<p><strong>Tags:</strong> <code>recoverability</code>, <code>release</code> · <strong>Traceability:</strong> <code>Q2</code>, <code>Q5</code> · <strong>API / artifact:</strong> <code>CI/CD</code></p>
+<p><strong>Precondition</strong></p>
+<ol><li>The release candidate plus its predecessor image and the feature flags</li></ol>
+<p><strong>Steps</strong></p>
+<ol><li>Deploy the candidate</li><li>Roll back to the predecessor and disable the new flags</li><li>Run the smoke and consistency checks</li></ol>
+<p><strong>Expected result</strong></p>
+<ol><li>Rollback completes within the window without a schema migration</li><li>Order/inventory consistency is preserved across the rollback</li><li>Any message produced by the new version remains consumable by the old one (schema compatibility verified)</li></ol>
+<h2>4. Inventory Synchronization Consistency (dedicated section)</h2>
+<p>This section is the cross-layer view of the requirement that matters most. It restates the guarantee, lists the defect classes it must prevent, defines who wins each conflict, and states the exact evidence that proves the guarantee holds.</p>
+<p><strong>S4.1 The guarantee, stated as falsifiable claims</strong></p>
+<table><thead><tr><th>#</th><th>Claim</th><th>How it can be falsified</th><th>Evidence of success</th></tr></thead><tbody><tr><td>G1</td><td>The platform never authorizes a sale it cannot fulfil from sellable stock</td><td>A successful order exists while available is negative, or oversell_count &gt; 0</td><td>Flash-sale case F3-03 and Q1-01 with exactly the configured quantity sold and zero negative samples</td></tr><tr><td>G2</td><td>Every physical movement is reflected exactly once in the ledger</td><td>A duplicate or replayed message changes a bucket twice, or a movement leaves no ledger row</td><td>Idempotency suite F2-08..F2-10, F2-17, F3-12; ledger sum checks I3/I4</td></tr><tr><td>G3</td><td>Platform and WMS converge to the same truth within one reconciliation cycle</td><td>diff ratio above tolerance persists across two cycles</td><td>Hourly diff job with a 24h zero-unexplained-diff report (F3-15, Q3-02)</td></tr><tr><td>G4</td><td>No reservation can outlive its purpose</td><td>A terminal order still holds reserved stock after the TTL</td><td>Reservation TTL guard case F2-19 and invariant I6</td></tr><tr><td>G5</td><td>Every divergence has an automated, audited repair path</td><td>A drift is found with no job that can repair it, or a repair is done by a raw UPDATE</td><td>Compensation sweep Q2-01 with reason-coded ADJUST entries</td></tr></tbody></table>
+<p><strong>S4.2 Defect classes this section must prevent (and the case that catches each)</strong></p>
+<table><thead><tr><th>Defect class</th><th>Typical root cause</th><th>Consequence</th><th>Caught by</th></tr></thead><tbody><tr><td>Oversell / negative available</td><td>Non-atomic check-then-update, cached availability used as authority, retry without idempotency</td><td>Money loss, cancellation, legal exposure</td><td>F3-02, F3-03, F3-04, Q1-01</td></tr><tr><td>Double deduct</td><td>Redelivered DEDUCT or duplicate payment callback</td><td>Phantom stock reduction, later oversell</td><td>F2-09, F2-10</td></tr><tr><td>Lost deduct (paid but not deducted)</td><td>Deduct call failed after payment succeeded, with no compensation</td><td>Silent drift, later oversell</td><td>F2-05, Q2-01</td></tr><tr><td>Leaked reservation</td><td>Cancel/close path missed, or a job failed after the state change</td><td>Sellable stock artificially reduced, lost sales</td><td>F2-06, F2-19</td></tr><tr><td>Restored stock that was never returned</td><td>Duplicate or pre-emptive RESTORE</td><td>Oversell on the next sale</td><td>F3-12, F2-17</td></tr><tr><td>Stale snapshot overwrite</td><td>Bulk sync applied without a version guard</td><td>Phantom stock or deleted live reservations</td><td>F2-14, F2-15</td></tr><tr><td>Out-of-order state corruption</td><td>Ship notice applied before allocation, or an old delta applied late</td><td>Incorrect order status, unreconcilable quantities</td><td>F2-11, F2-12, Q2-04</td></tr><tr><td>Silent sync stop</td><td>Consumer died, backlog grew, nobody noticed</td><td>Divergence grows for days</td><td>Q3-01, Q3-02</td></tr><tr><td>Unrepaired drift</td><td>No reconciliation, or a repair that cannot be replayed</td><td>Audit failure, manual firefighting</td><td>F2-18, F2-20, Q2-01</td></tr></tbody></table>
+<p><strong>S4.3 Conflict resolution rules (who wins, and why)</strong></p>
+<table><thead><tr><th>Conflict</th><th>Winner</th><th>Rule</th><th>Losing side's role</th></tr></thead><tbody><tr><td>Physical stock: platform view vs WMS on_hand</td><td>WMS</td><td>WMS is the source of truth for on_hand</td><td>The platform records the drift and raises an alert; it never silently rewrites live reservations</td></tr><tr><td>Sellability: cache vs ledger</td><td>Ledger</td><td>A reserve is authorized by the transactional ledger, never by a cached read</td><td>The cache serves reads only and is marked stale when being rebuilt</td></tr><tr><td>Order state: state machine vs late callback</td><td>State machine guard</td><td>A terminal or later state rejects the older event, and the event is not lost, it is routed to a queue</td><td>The callback is acknowledged to prevent a retry storm</td></tr><tr><td>Message ordering: two delta events for the same SKU</td><td>Higher event_ts</td><td>Monotonic per-SKU apply by event_ts</td><td>The older event is discarded and counted in a metric</td></tr><tr><td>Snapshot vs in-flight reservation</td><td>The in-flight reservation</td><td>A bulk snapshot can never delete a live reservation</td><td>The snapshot is applied to on_hand and the difference becomes a reported drift</td></tr><tr><td>Return restore: QC result vs RMA quantity</td><td>QC result</td><td>Only the received quantity with QC PASS is restored</td><td>The rest stays sold and remains reconcilable</td></tr></tbody></table>
+<p><strong>S4.4 Test approach and exit thresholds for consistency</strong></p>
+<table><thead><tr><th>Activity</th><th>Method</th><th>Pass threshold</th></tr></thead><tbody><tr><td>Invariant assertion</td><td>Assert I1, I2, I3, I5 before and after every inventory-touching test, plus continuous sampling during load tests</td><td>Zero violations across the entire run</td></tr><tr><td>Fault injection</td><td>The matrix in F2 (dropped responses, duplicates, reordering, stale versions, 500s, timeouts, MQ restarts)</td><td>100% of injected faults handled per the declared policy; zero untriaged DLQ entries</td></tr><tr><td>Concurrency</td><td>Synchronized-start contention runs, repeated at least 20 times per case</td><td>Zero oversell and zero negative buckets in every iteration</td></tr><tr><td>Long soak</td><td>8h at 1.2x peak with sync traffic included</td><td>Diff ratio does not grow with time; no leaked reservations at the end of the soak</td></tr><tr><td>Reconciliation</td><td>Run hourly and nightly jobs over all data produced during the test campaign</td><td>diff ratio &lt; 0.05% per warehouse; zero unexplained diffs; every auto-repair audited</td></tr><tr><td>Ledger audit</td><td>Recompute every bucket from the ledger for the test data set</td><td>100% of SKUs balance; any mismatch blocks the release</td></tr></tbody></table>
+<pre class="diagram">flowchart TB
+  A[Order create] --&gt;|atomic reserve| B{Ledger invariant OK?}
+  B -- no --&gt; P0[Reject write + P0 page + freeze SKU]
+  B -- yes --&gt; C[available-&gt;reserved]
+  C --&gt; D[Payment callback]
+  D --&gt;|idempotent deduct| E[reserved-&gt;sold, on_hand-1]
+  D --&gt;|deduct failed| J[Compensation sweep detects paid-not-deducted]
+  J --&gt; E
+  C --&gt;|cancel or TTL| F[reserved-&gt;available]
+  E --&gt; G[WMS ship notice]
+  G --&gt; H[Outbound confirm reconciles sold vs shipped]
+  H --&gt; I{Recon diff &lt; tolerance?}
+  I -- no --&gt; K[Classify A/B/C, ADJUST with reason, audit]
+  K --&gt; I
+  I -- yes --&gt; L[Consistency proven]</pre>
+<h2>5. Exception Handling and Compensation Strategy (dedicated section)</h2>
+<p>Two rules drive everything below. First, classify before you decide: a business rejection, a transient system fault and a data inconsistency need three different responses. Second, never leave a partial effect: if the second half of a two-step operation cannot complete, a named compensation job must own it within a stated SLA.</p>
+<p><strong>S5.1 Exception taxonomy and handling policy</strong></p>
+<table><thead><tr><th>Class</th><th>Examples</th><th>Detection</th><th>Handling policy</th><th>Retry?</th><th>User-visible outcome</th></tr></thead><tbody><tr><td>Business rejection</td><td>Insufficient stock, off-shelf SKU, illegal state, quantity limit, RMA outside the return window</td><td>Validation and state guards at the boundary</td><td>Reject with the documented code; change nothing</td><td>No (unless a documented transition happens, e.g. stock replenishment)</td><td>Clear, specific message; no order created</td></tr><tr><td>Transient system fault</td><td>Timeout, connection reset, 5xx from a dependency, throttle</td><td>Client error classification plus the circuit breaker</td><td>Retry with bounded exponential backoff and jitter on idempotent operations</td><td>Yes, max 3</td><td>Slight delay, then success or a retryable message</td></tr><tr><td>Permanent external rejection</td><td>WMS contract violation, schema error, unknown version, illegal tracking number</td><td>Schema validation and DLQ routing</td><td>Route to the DLQ with a reason, alert, fix and replay with approval</td><td>No</td><td>Stuck-order alert; ops intervene with a runbook</td></tr><tr><td>Data inconsistency</td><td>Ledger imbalance, invariant violation, unexplained diff</td><td>Reconciliation jobs, invariant assertions</td><td>Reject the offending write, freeze the affected SKU, classify A/B/C and repair with an audited ADJUST</td><td>No</td><td>SKU temporarily unsellable rather than oversold</td></tr><tr><td>Money-related exception</td><td>Amount mismatch, duplicate refund, callback for a closed order, successful refund with no order</td><td>Callback validation plus the nightly three-way recon</td><td>Never auto-revive an order; route to the money-exception queue with a P0/P1 alert and a named owner</td><td>No</td><td>Manual resolution with an audit record</td></tr><tr><td>Human/ops exception</td><td>Manual adjustment, emergency recall, damaged goods</td><td>Ops tooling with approval workflow</td><td>Requires role permission, reason code and a ticket reference; never a raw database write</td><td>No</td><td>Auditable adjustment</td></tr></tbody></table>
+<p><strong>S5.2 Compensation job catalog (each drift class has exactly one owner)</strong></p>
+<table><thead><tr><th>Job</th><th>Trigger / scope</th><th>Action</th><th>Idempotency key</th><th>SLA</th><th>Escalation</th></tr></thead><tbody><tr><td>compPaidNotDeducted</td><td>Paid orders with no DEDUCT ledger entry</td><td>Apply DEDUCT once, then continue normal fulfillment</td><td>pay_no + sku_id + DEDUCT</td><td>15min</td><td>P1 if the count exceeds 100</td></tr><tr><td>compShippedNotDeducted</td><td>WMS outbound confirm with no matching platform deduct</td><td>Apply DEDUCT and record the reconciliation batch</td><td>so_id + sku_id + SHIP_DEDUCT</td><td>30min</td><td>P1</td></tr><tr><td>compReleaseStaleReservation</td><td>Reservations whose order is terminal or past TTL</td><td>Apply RELEASE with reason RESERVATION_TTL</td><td>order_no + sku_id + RELEASE</td><td>Hourly</td><td>P2</td></tr><tr><td>compRestoreReturn</td><td>Return received with QC PASS and no RESTORE</td><td>Apply RESTORE once</td><td>rma_no + sku_id + RESTORE</td><td>30min</td><td>P1</td></tr><tr><td>compReplayLostCallback</td><td>Order PAID with an unresolved payment record, or a callback rejected for a transient reason</td><td>Replay the callback through the idempotent path</td><td>pay_no + REPLAY</td><td>15min</td><td>P1</td></tr><tr><td>compReconAdjust</td><td>Diff ratio above tolerance after classification</td><td>Apply ADJUST with reason RECON_AUTO and a recon_batch_id</td><td>recon_batch_id + sku_id + seq</td><td>1h</td><td>P0 if the ratio exceeds 0.5%</td></tr><tr><td>compDlqReplay</td><td>DLQ entries with a fixed root cause</td><td>Replay with approval; verify the effect was applied exactly once</td><td>original message_id</td><td>4h</td><td>P1 if the DLQ exceeds 100</td></tr></tbody></table>
+<p><strong>S5.3 Pattern selection per boundary</strong></p>
+<table><thead><tr><th>Boundary</th><th>Pattern</th><th>Why this pattern</th><th>Failure handling</th></tr></thead><tbody><tr><td>Order create -&gt; inventory reserve</td><td>Local transaction (atomic single-resource)</td><td>Both live in the platform inventory service, so no distributed transaction is needed</td><td>On failure, nothing is persisted; the caller receives a retryable or business code</td></tr><tr><td>Payment -&gt; order -&gt; inventory</td><td>Idempotent event with a unique business key (pay_no)</td><td>The gateway cannot participate in a distributed transaction</td><td>Duplicate callbacks are no-ops; a lost callback is recovered by compReplayLostCallback</td></tr><tr><td>Order -&gt; WMS/SC2P fulfillment</td><td>Saga with forward recovery (retry) plus a compensating cancel</td><td>The warehouse cannot roll back a physical pick; forward progress is the only safe direction</td><td>Retry the SO push; if a cancel is needed, send CancelSO and reconcile the ledger</td></tr><tr><td>Return -&gt; refund</td><td>Saga with compensation in the reverse order (restore stock, then refund)</td><td>Stock and money must not diverge; stock restore is reversible, the refund is not</td><td>If the refund fails after the restore, retry the refund and alert; never re-deduct silently</td></tr><tr><td>Bulk stock sync</td><td>Version-guarded idempotent apply with a reconciliation safety net</td><td>The sync is a mass overwrite, so version control plus recon is the only safe combination</td><td>Apply only newer versions; report the remainder as drift</td></tr></tbody></table>
+<p><strong>S5.4 Manual intervention playbook (what the runbook must contain)</strong></p>
+<table><thead><tr><th>Situation</th><th>First action</th><th>Never do</th><th>Evidence to produce</th></tr></thead><tbody><tr><td>Oversell on a live SKU</td><td>Freeze the SKU from sale, stop the offending job, identify affected orders, notify CS</td><td>Do not delete orders or edit quantities directly</td><td>Incident timeline, affected order list, repair batch id, post-mortem</td></tr><tr><td>Unbalanced ledger for a SKU</td><td>Freeze the SKU, rebuild the buckets from the ledger, compare with WMS</td><td>Do not hand-edit the on_hand column</td><td>Rebuild report, before/after values, approval record</td></tr><tr><td>Money exception (duplicate refund / orphan payment)</td><td>Route to the money queue with a P0 alert, block automated retries</td><td>Do not auto-revive a closed order</td><td>Payment reconciliation report, refund ledger, resolution note</td></tr><tr><td>WMS contract break</td><td>Stop the consumer, preserve the DLQ, fix the contract or the mapper, replay with approval</td><td>Do not drop DLQ messages to clear the alert</td><td>DLQ reason histogram, replay log, verification that no duplicate effect occurred</td></tr></tbody></table>
+<h2>6. Release Entry and Exit Criteria (dedicated section)</h2>
+<p>The criteria turn the release decision into a checklist. Entry criteria protect the test team's time; exit criteria protect production. Any exit criterion that fails blocks the release unless a named approver signs a documented exception with an expiry.</p>
+<p><strong>S6.1 Entry criteria (all must hold before the test round starts)</strong></p>
+<table><thead><tr><th>#</th><th>Criterion</th><th>Evidence</th></tr></thead><tbody><tr><td>EN1</td><td>Requirements and design frozen; the MFQ models (M1-M5) reviewed and approved by the system owner</td><td>Signed design doc plus a review record referencing the model versions</td></tr><tr><td>EN2</td><td>External contracts frozen: the OpenAPI/JSON Schema for messages E1, E8 and E9, the MQ schema for E2-E7, and the shared error-code dictionary</td><td>Published contract artefacts; contract tests green in the pipeline</td></tr><tr><td>EN3</td><td>Test environment deployed at production-like topology, including the WMS/SC2P mock with a fault-injection switch per message type</td><td>Environment readiness checklist; a smoke run proving each injection works</td></tr><tr><td>EN4</td><td>Observability live in the test environment: metrics, dashboards and alerts deployed with production thresholds</td><td>Dashboard link plus one successfully fired test alert</td></tr><tr><td>EN5</td><td>Test data prepared and resettable: SKU/warehouse/stock fixtures, user accounts, payment sandbox, and a one-command data reset</td><td>Data provision record; reset script executed successfully twice</td></tr><tr><td>EN6</td><td>Entry smoke passes: order -&gt; pay -&gt; allocate -&gt; ship -&gt; sign -&gt; return -&gt; refund end-to-end</td><td>Smoke report with timestamps</td></tr><tr><td>EN7</td><td>Performance baseline recorded and the load model reviewed against the projected peak</td><td>Baseline report; load script version pinned</td></tr><tr><td>EN8</td><td>Rollback plan and feature flags defined; the predecessor image is available</td><td>Release checklist item signed by the release owner</td></tr><tr><td>EN9</td><td>Defect severity definitions and the triage cadence agreed with the stakeholders</td><td>Agreed severity matrix and triage meeting invite</td></tr></tbody></table>
+<p><strong>S6.2 Exit criteria (all must hold before the release is approved)</strong></p>
+<table><thead><tr><th>#</th><th>Criterion</th><th>Threshold</th><th>Blocking?</th></tr></thead><tbody><tr><td>X1</td><td>P0 case execution</td><td>100% executed and 100% passed</td><td>Yes</td></tr><tr><td>X2</td><td>P1 case execution</td><td>&gt;= 98% passed; every failure either fixed or explicitly deferred by the release owner</td><td>Yes</td></tr><tr><td>X3</td><td>P2 cases</td><td>Executed or explicitly triaged with an owner and a due date</td><td>No</td></tr><tr><td>X4</td><td>Open defects</td><td>Zero open Sev1/Sev2; Sev3 within the agreed cap with documented workarounds; no open defect touching the ledger invariant</td><td>Yes</td></tr><tr><td>X5</td><td>Traceability</td><td>100% of the mandatory requirements (MFQ must-include list) traced to at least one executed case; the traceability matrix is generated, not hand-written</td><td>Yes</td></tr><tr><td>X6</td><td>Inventory consistency</td><td>oversell_count = 0; zero negative buckets; diff ratio &lt; 0.05% per warehouse after a 24h continuous reconciliation; all ledger invariants (I1-I6) hold for the whole test data set</td><td>Yes</td></tr><tr><td>X7</td><td>Idempotency and ordering</td><td>100% pass of the duplicate/reorder/fault-injection suites; zero untriaged DLQ entries</td><td>Yes</td></tr><tr><td>X8</td><td>Performance</td><td>All targets in Q1 met at 1.5x peak; the 8h soak shows no leak and a stable diff ratio; zero oversell at the breakpoint</td><td>Yes</td></tr><tr><td>X9</td><td>Reliability</td><td>Every chaos scenario CH1-CH8 executed with the declared outcome; all seeded drifts repaired within SLA by the compensation jobs</td><td>Yes</td></tr><tr><td>X10</td><td>Observability</td><td>Every alert in the Q3 catalog verified to fire; the dashboard set complete; no PII in logs (CI scan green)</td><td>Yes</td></tr><tr><td>X11</td><td>Security</td><td>No open high/critical finding; masking verified; callback authenticity tests pass; the dependency scan is clean</td><td>Yes</td></tr><tr><td>X12</td><td>Recoverability</td><td>Backup restore and failover drills D1/D2 completed within RTO/RPO; the repair runbook validated by someone other than its author</td><td>Yes</td></tr><tr><td>X13</td><td>Regression</td><td>The automated regression suite passes at &gt;= 95%; no regression in adjacent modules (payment, promotion, logistics)</td><td>Yes</td></tr><tr><td>X14</td><td>Documentation</td><td>Test summary report published, known-issues list published, release notes carry the residual-risk statement</td><td>Yes</td></tr></tbody></table>
+<p><strong>S6.3 Residual-risk acceptance (what is knowingly deferred)</strong></p>
+<table><thead><tr><th>Deferred item</th><th>Reason</th><th>Mitigation</th><th>Approver</th></tr></thead><tbody><tr><td>Exhaustive payment-channel matrix</td><td>Only the primary channel carries the volume this iteration</td><td>Channels share the same callback contract, covered by F4-07; the second channel is covered in the following iteration</td><td>Product owner</td></tr><tr><td>Long-duration (72h) soak</td><td>Time-boxed release window</td><td>8h soak plus hourly reconciliation evidence</td><td>QA lead</td></tr><tr><td>Multi-region/DR switch</td><td>Not part of the current topology</td><td>Failover drill D1 covers the single-region primary/replica case</td><td>Architect</td></tr><tr><td>UI-level accessibility of the checkout journey</td><td>Out of the API-focused scope of this plan</td><td>Tracked as a separate workstream</td><td>Product owner</td></tr></tbody></table>
+<h2>7. Mandatory requirement coverage (traceability matrix)</h2>
+<p>Every item the brief marks as mandatory, mapped to the cases that cover it. The mapping is checked in both directions at build time: an uncovered requirement fails the build, and so does a case that no requirement row claims.</p>
+<table><thead><tr><th>Layer</th><th>Mandatory requirement</th><th>Covered by</th></tr></thead><tbody><tr><td>M</td><td>End-to-end business flow model (order -&gt; payment -&gt; shipment -&gt; signed -&gt; return)</td><td><code>M1</code>, <code>M1.1</code>, <code>F1-01</code>, <code>F1-06</code>, <code>F1-07</code>, <code>F1-09</code>, <code>F1-12</code></td></tr><tr><td>M</td><td>Order state machine (states, events, transition conditions)</td><td><code>M2</code>, <code>F1-11</code>, <code>F3-06</code>, <code>F3-07</code>, <code>F3-16</code>, <code>F4-11</code></td></tr><tr><td>M</td><td>Inventory state model (available, reserved, deducted, restored)</td><td><code>M3</code>, <code>F2-01</code>, <code>F2-04</code>, <code>F2-06</code>, <code>F2-17</code>, <code>F3-10</code>, <code>F3-15</code></td></tr><tr><td>M</td><td>External interaction model (storefront &lt;-&gt; WMS/SC2P)</td><td><code>M4</code>, <code>M4.1</code>, <code>F1-03</code>, <code>F1-07</code>, <code>F2-11</code>, <code>F4-08</code>, <code>F4-09</code></td></tr><tr><td>M</td><td>Consistency boundaries (strong, eventual, reconciliation points)</td><td><code>M5</code>, <code>M5.1</code>, <code>F2-14</code>, <code>F2-15</code>, <code>F2-18</code>, <code>F2-20</code>, <code>Q2-01</code></td></tr><tr><td>F</td><td>Core happy path coverage (order, payment, shipment, signed)</td><td><code>F1-01</code>, <code>F1-02</code>, <code>F1-06</code>, <code>F1-07</code>, <code>F1-08</code>, <code>F1-09</code>, <code>F1-10</code>, <code>F1-12</code></td></tr><tr><td>F</td><td>Cart validation and order acceptance (off-shelf SKU, price change between add-to-cart and submit)</td><td><code>F1-04</code>, <code>F1-05</code></td></tr><tr><td>F</td><td>Inventory sync: reserve success / failure</td><td><code>F2-01</code>, <code>F2-02</code>, <code>F2-03</code>, <code>F3-01</code></td></tr><tr><td>F</td><td>Inventory sync: deduct success / failure</td><td><code>F2-04</code>, <code>F2-05</code>, <code>Q2-01</code>, <code>Q2-03</code></td></tr><tr><td>F</td><td>Inventory sync: cancel and restore</td><td><code>F2-06</code>, <code>F2-07</code>, <code>F2-19</code>, <code>F3-10</code>, <code>F3-11</code></td></tr><tr><td>F</td><td>Inventory sync: idempotency for duplicate messages and duplicated requests</td><td><code>F2-08</code>, <code>F2-09</code>, <code>F2-10</code>, <code>F2-17</code>, <code>F3-12</code>, <code>F3-14</code>, <code>F4-02</code></td></tr><tr><td>F</td><td>Inventory sync: out-of-order message handling</td><td><code>F2-11</code>, <code>F2-12</code>, <code>F2-13</code>, <code>Q2-04</code></td></tr><tr><td>F</td><td>Boundary: zero stock</td><td><code>F3-01</code>, <code>F2-02</code></td></tr><tr><td>F</td><td>Boundary: quantity limits and oversized payload</td><td><code>F3-05</code>, <code>F3-13</code></td></tr><tr><td>F</td><td>Boundary: high-concurrency flash sale</td><td><code>F3-02</code>, <code>F3-03</code>, <code>F3-04</code>, <code>F3-15</code>, <code>Q1-01</code></td></tr><tr><td>F</td><td>Boundary: partial shipment / split shipment</td><td><code>F1-08</code>, <code>F3-08</code>, <code>F3-09</code></td></tr><tr><td>F</td><td>Boundary: return and stock restoration</td><td><code>F1-12</code>, <code>F3-10</code>, <code>F3-11</code>, <code>F3-12</code></td></tr><tr><td>F</td><td>Critical API validation: request fields</td><td><code>F4-01</code>, <code>F4-05</code>, <code>F4-06</code>, <code>F4-10</code>, <code>F4-11</code></td></tr><tr><td>F</td><td>Critical API validation: error codes</td><td><code>F4-05</code>, <code>F4-07</code>, <code>F4-08</code>, <code>F4-09</code></td></tr><tr><td>F</td><td>Critical API validation: callback / write-back fields</td><td><code>F4-07</code>, <code>F4-08</code>, <code>F4-09</code>, <code>Q4-01</code></td></tr><tr><td>Q</td><td>Performance: concurrency target, latency, error rate, throughput</td><td><code>Q1-01</code>, <code>Q1-02</code>, <code>Q1-03</code>, <code>Q1-04</code></td></tr><tr><td>Q</td><td>Reliability: retry, fallback, timeout, circuit breaker, compensation jobs</td><td><code>Q2-01</code>, <code>Q2-02</code>, <code>Q2-03</code>, <code>Q2-04</code></td></tr><tr><td>Q</td><td>Observability: logs, metrics, alerts (inventory diff ratio, message backlog, stuck orders)</td><td><code>Q3-01</code>, <code>Q3-02</code>, <code>Q3-03</code>, <code>Q3-04</code></td></tr><tr><td>Q</td><td>Security: auth, permission boundaries, sensitive-data masking</td><td><code>Q4-01</code>, <code>Q4-02</code>, <code>Q4-03</code>, <code>F4-03</code>, <code>F4-04</code>, <code>F4-12</code>, <code>F4-13</code></td></tr><tr><td>Q</td><td>Recoverability: failure drills and data repair process</td><td><code>Q5-01</code>, <code>Q5-02</code>, <code>Q5-03</code>, <code>Q5-04</code></td></tr><tr><td>S4</td><td>Dedicated section: inventory synchronization consistency</td><td><code>S4</code>, <code>F2-01..F2-20</code>, <code>F3-02</code>, <code>F3-03</code>, <code>F3-15</code>, <code>Q1-01</code>, <code>Q3-02</code></td></tr><tr><td>S5</td><td>Dedicated section: exception handling and compensation strategy</td><td><code>S5</code>, <code>F2-05</code>, <code>F2-07</code>, <code>Q2-01</code>, <code>Q2-03</code></td></tr><tr><td>S6</td><td>Dedicated section: release entry / exit criteria</td><td><code>S6</code>, <code>Q4-04</code>, <code>Q5-04</code></td></tr></tbody></table>
+<h2>8. Deliverable map</h2>
+<table><thead><tr><th>Submission requirement</th><th>Deliverable in this repository</th></tr></thead><tbody><tr><td>Test cases with case tree, priority and expected result</td><td>docs/01-test-plan-mfq.md (case tree + priority + expected result) and test-cases/MFQ-test-cases.xlsx (flat, filterable)</td></tr><tr><td>Mind map in .xmind (preferred) or XMind-importable structured Markdown</td><td>mindmaps/MFQ-Test-Plan.xmind (both provided; Markdown is the import fallback)</td></tr><tr><td>Bonus: mind map with a clear MFQ-layer structure</td><td>mindmaps/MFQ-Test-Plan.xmind - top level is exactly M / F / Q, each colour-coded, with a dedicated-sections branch and priority markers on every case</td></tr><tr><td>Brief strategy note, within 1 page, explaining priorities and trade-offs</td><td>docs/03-strategy-note.md and docs/03-strategy-note.pdf</td></tr></tbody></table>
+<h2>9. Appendix</h2>
+<h3>A.1 Priority definitions used throughout the case tree</h3>
+<table><thead><tr><th>Priority</th><th>Meaning</th></tr></thead><tbody><tr><td>P0</td><td>Release-blocking. Money, inventory truth, or an irreversible one-way door. Executed on every build and every candidate.</td></tr><tr><td>P1</td><td>Core regression. The flow a normal customer walks. Executed every test round; a failure blocks the release unless explicitly deferred.</td></tr><tr><td>P2</td><td>Robustness, edge and hygiene. Executed at milestones; a failure is triaged rather than automatically blocking.</td></tr></tbody></table>
+<h3>A.2 Defect severity definitions</h3>
+<table><thead><tr><th>Severity</th><th>Meaning</th></tr></thead><tbody><tr><td>Sev1</td><td>Data corruption or money loss: oversell, double deduct, lost payment, wrong refund. Stop the release.</td></tr><tr><td>Sev2</td><td>Core function unusable or a wrong customer-facing outcome with no workaround.</td></tr><tr><td>Sev3</td><td>Function degraded or a wrong outcome with a workaround.</td></tr><tr><td>Sev4</td><td>Cosmetic, logging or documentation defect.</td></tr></tbody></table>
+<h3>A.3 Priority distribution of this case set</h3>
+<table><thead><tr><th>Priority</th><th>Cases</th></tr></thead><tbody><tr><td>P0</td><td>47</td></tr><tr><td>P1</td><td>31</td></tr><tr><td>P2</td><td>3</td></tr></tbody></table>
+<h3>A.4 Execution guidance</h3>
+<ul><li>Smoke (every build, ~30min): the F1 happy path plus F2-01/F2-04/F2-08/F2-10.</li><li>Core regression (every test round): all P0 plus the P1 inventory-sync block.</li><li>Consistency campaign (per release): the whole F2 fault-injection matrix, repeated at least 20 times for the race cases, plus Q1-01 and Q2-01.</li><li>Non-functional campaign (per release): Q1 targets at 1.5x peak, the Q2 chaos set, every alert in the Q3 catalog, Q4 security suite, Q5 drills.</li><li>Entry/exit gate: see section 6 (release entry/exit criteria); the traceability matrix plus the invariant evidence is the release evidence pack.</li></ul>
+<h3>A.5 Test data and environment</h3>
+<ul><li>Environments: DEV (functional), TEST/STAGE (integration, fault injection, full MFQ run), PERF (production-like topology, isolated data).</li><li>WMS/SC2P mock must expose a per-message fault-injection switch covering the matrix in the F2 section, plus controllable latency and version fields for E4/E5.</li><li>Payment: sandbox gateway plus a signed-callback replay tool with controllable pay_no, amount and timestamp.</li><li>Data: SKU/warehouse/stock fixtures, a conflict fixture (a single unit of stock for the race cases), and a one-command reset that also clears the ledger.</li><li>Every automated inventory assertion must read the ledger, not just the API response; the ledger is the oracle.</li></ul>
+<hr/>
+<p>Generated from <code>data/</code> by <code>scripts/build.py</code>. Do not edit this file by hand: change the data modules and rebuild, so the document, the mind map and the spreadsheet can never disagree.</p>
+</body></html>
